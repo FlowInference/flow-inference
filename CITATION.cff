@@ -1,0 +1,28 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+type: software
+title: "flow_inference: guided flow-based sampling of stochastic processes"
+abstract: >-
+  Draws samples of a stochastic process (a Gaussian process, an SDE solution, or a
+  process learned by a neural flow) that satisfy user-specified conditions, by
+  integrating a guided probability-flow ODE or SDE from noise to the process.
+authors:
+  - given-names: Tom
+    family-names: Cowperthwaite
+  - given-names: Louis
+    family-names: Sharrock
+  - given-names: Lachlan
+    family-names: Astfalck
+  - given-names: Henry
+    family-names: Moss
+    affiliation: Lancaster University
+version: 0.1.0
+license: MIT
+repository-code: "https://github.com/FlowInference/flow-inference"
+keywords:
+  - gaussian processes
+  - stochastic differential equations
+  - diffusion models
+  - flow matching
+  - guidance
+  - conditional sampling

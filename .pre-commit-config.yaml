@@ -1,0 +1,59 @@
+# Pre-commit / pre-push hooks for flow_inference.
+#
+#   pre-commit install --install-hooks      # set up the commit-time formatters
+#   pre-commit install --hook-type pre-push  # set up the push-time test gate
+#
+# On commit: ruff auto-fixes lint issues and reformats staged files (config in
+# pyproject.toml), and nbstripout clears notebook outputs/metadata so heavy
+# rendered cells never enter git history. On push: the test suite must pass
+# before the push proceeds.
+# Notebooks are excluded from the text formatters (ruff is Python-only anyway;
+# trailing-whitespace / end-of-file-fixer would corrupt the JSON) — nbstripout
+# is the only hook that rewrites them.
+
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.17
+    hooks:
+      # Lint with autofix; settings come from [tool.ruff.lint] in pyproject.toml.
+      - id: ruff-check
+        args: [--fix]
+        types_or: [python, pyi]
+        exclude: '^figs/'
+      # Autoformat.
+      - id: ruff-format
+        types_or: [python, pyi]
+        exclude: '^figs/'
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+        exclude: '(\.ipynb$|^figs/)'
+      - id: end-of-file-fixer
+        exclude: '(\.ipynb$|^figs/)'
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: [--maxkb=5000]
+      - id: check-toml
+      - id: check-yaml
+
+  # Strip notebook outputs, execution counts and volatile metadata before they
+  # reach git history. This is what keeps the repo from re-bloating: rendered
+  # plots/images are no longer committed inside the .ipynb files.
+  - repo: https://github.com/kynan/nbstripout
+    rev: 0.9.1
+    hooks:
+      - id: nbstripout
+
+  # Tests must pass before a push is allowed. Runs the default (fast) suite —
+  # slow tests stay opt-in via the `-m "not slow"` default in pyproject.toml.
+  - repo: local
+    hooks:
+      - id: pytest
+        name: pytest (must pass before push)
+        entry: python -m pytest
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]

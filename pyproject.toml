@@ -1,0 +1,57 @@
+[project]
+name = "flow_inference"
+version = "0.1.0"
+description = "Guided flow-based sampling of stochastic processes under user-specified conditions"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.12"
+dependencies = [
+    "torch>=2.4",
+    "gpytorch>=1.15.1",
+    "tqdm>=4.67.3",
+]
+
+[project.optional-dependencies]
+# Only the example notebooks need these — the library itself does no plotting
+# (see examples/plotting.py) and reads no data files.
+examples = [
+    "jupyter>=1.1.1",
+    "matplotlib>=3.10.8",
+    "numpy>=2.0",
+    "pandas>=3.0.1",
+]
+
+[dependency-groups]
+dev = [
+    "ipykernel>=6.29",
+    "nbclient>=0.10",
+    "nbformat>=5.10",
+    "pre-commit>=4.5.1",
+    "pytest>=9.0.2",
+    "ruff>=0.15.5",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.ruff.lint]
+extend-select = [
+  "B",      # flake8-bugbear
+  "I",      # isort
+  "RUF",    # Ruff-specific
+  "UP",     # pyupgrade
+]
+# Mathematical notation used throughout docstrings/comments — not typos.
+allowed-confusables = ["σ", "−", "ρ", "γ", "α", "×", "ν", "–"]
+
+[tool.pytest.ini_options]
+minversion = "9.0"
+addopts = ["-ra", "--tb=short", "-m", "not slow and not notebooks"]
+log_level = "INFO"
+testpaths = ["tests"]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "notebooks: executes the example notebooks with capped budgets (run with '-m notebooks')",
+]
