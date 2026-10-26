@@ -220,7 +220,7 @@ class IntegratorSampler(nn.Module):
     def sample(
         self,
         num_samples: int,
-        num_steps: int = 1_000,
+        num_steps: int | None = None,
         guidance: GuidanceApproximation | None = None,
         corrector: PCNCorrector | None = None,
         time_schedule: str = "snr",
@@ -228,12 +228,19 @@ class IntegratorSampler(nn.Module):
         sde: bool = False,
         final_denoise: bool = True,
         verbose: bool = True,
+        adaptive: bool = False,
+        rtol: float = 1e-2,
+        atol: float = 1e-2,
+        t_min: float = 1e-3,
+        max_steps: int = 10_000,
     ) -> torch.Tensor:
         """Generate samples by integrating the probability-flow ODE (or SDE).
 
         Args:
             num_samples:   Number of independent trajectories to simulate.
-            num_steps:     Number of integration steps.
+            num_steps:     Number of integration steps (default 1000). Fixed-step only:
+                           with ``adaptive=True`` the controller picks the step count,
+                           so passing it raises.
             final_denoise: If True (default), replace the final integrated state with
                            the analytic Tweedie denoiser E[x_0 | x_t] = predict_terminal
                            at the last integration time. Near t→0 the probability-flow
@@ -252,6 +259,7 @@ class IntegratorSampler(nn.Module):
                            - "linear"    : uniform spacing in t.
                            - "quadratic" : steps denser near t=0.
                            - "snr"       : equal log-SNR increments per step.
+                           Ignored when ``adaptive=True``.
             solver:        Base integration method. Options:
                            - "euler" : 1st-order Forward Euler.
                            - "heun"  : 2nd-order Heun / RK2.
@@ -259,6 +267,16 @@ class IntegratorSampler(nn.Module):
             sde:           If True, inject noise at each step (stochastic sampling).
                            Compatible with solver="euler" (Euler-Maruyama) and
                            solver="heun" (stochastic Heun for the VP SDE).
+            adaptive:      If True, choose step sizes on the fly from an embedded
+                           Euler/Heun error estimate (see :meth:`_integrate_adaptive`).
+                           Supports solver="euler" or "heun", ODE or SDE. Step
+                           statistics are stored in ``self.adaptive_stats``.
+            rtol, atol:    Adaptive only: per-coordinate tolerance
+                           ``atol + rtol * |z|`` on the local error.
+            t_min:         Adaptive only: integrate from t=1 down to ``t_min``, where
+                           ``final_denoise`` takes over.
+            max_steps:     Adaptive only: cap on trial steps (accepted + rejected);
+                           raises if hit.
         Returns:
             Tensor of shape (num_samples, C, *output_shape) in the data space
             (output_shape defaults to (N,); e.g. (H, W) for grid flows).
@@ -272,14 +290,19 @@ class IntegratorSampler(nn.Module):
                 "accept ratio and terminal-posterior draws would use the wrong "
                 "schedule and whitening."
             )
+        if adaptive and num_steps is not None:
+            raise ValueError(
+                "num_steps is chosen by the controller when adaptive=True; set "
+                "rtol/atol for accuracy, or max_steps to cap the trial steps."
+            )
+        if num_steps is None:
+            num_steps = 1_000
 
         z = torch.randn(
             (num_samples, self.flow.channels, self.flow.latent_dim),
             device=self.device,
             dtype=self.flow.dtype,
         )
-
-        ts = self._get_time_schedule(num_steps, time_schedule)
 
         # Define drift once — avoids re-creating a closure every step
         def compute_drift(z_eval, t_eval):
@@ -288,6 +311,61 @@ class IntegratorSampler(nn.Module):
             if guidance is not None:
                 dv = dv + guidance(z_eval, t_eval)
             return dv
+
+        if adaptive:
+            z, t_last = self._integrate_adaptive(
+                z,
+                compute_drift,
+                corrector,
+                solver,
+                sde,
+                max_steps,
+                rtol,
+                atol,
+                t_min,
+                verbose,
+            )
+        else:
+            z, t_last = self._integrate_fixed(
+                z,
+                compute_drift,
+                corrector,
+                num_steps,
+                time_schedule,
+                solver,
+                sde,
+                final_denoise,
+                verbose,
+            )
+
+        if final_denoise:
+            # E[x_0 | x_t] at the last integrated time removes the residual grain that
+            # the stiff tail of the ODE leaves behind.
+            with torch.no_grad():
+                z = self.flow.predict_terminal(z, t_last)
+
+        # Map from the internal (e.g. whitened) representation to data space, then
+        # reshape to the flow's natural display shape ((B, C, H, W) for grid flows,
+        # unchanged (B, C, N) for 1D fields / paths) so callers needn't reshape.
+        f = self.flow._to_data_space(z)
+        if was_training:  # leave the caller's train/eval mode as we found it
+            self.flow.train()
+        return self.flow.to_display(f).detach()
+
+    def _integrate_fixed(
+        self,
+        z,
+        compute_drift,
+        corrector,
+        num_steps,
+        time_schedule,
+        solver,
+        sde,
+        final_denoise,
+        verbose,
+    ):
+        """Integrate on a fixed time grid. Returns ``(z, t_last)``."""
+        ts = self._get_time_schedule(num_steps, time_schedule)
 
         if sde:
             # One large randn instead of num_steps small ones — avoids repeated CUDA kernel launches.
@@ -360,17 +438,121 @@ class IntegratorSampler(nn.Module):
             if corrector is not None:
                 # Corrector runs at the time the state now sits at, not t_curr.
                 z = corrector(z, t_next)
+        return z, ts[last_step]
 
-        if final_denoise:
-            # E[x_0 | x_t] at the last integrated time removes the residual grain that
-            # the stiff tail of the ODE leaves behind.
-            with torch.no_grad():
-                z = self.flow.predict_terminal(z, ts[num_steps - 1])
+    def _integrate_adaptive(
+        self,
+        z,
+        compute_drift,
+        corrector,
+        solver,
+        sde,
+        max_steps,
+        rtol,
+        atol,
+        t_min,
+        verbose,
+    ):
+        """Integrate from t=1 to ``t_min`` with error-controlled step sizes.
 
-        # Map from the internal (e.g. whitened) representation to data space, then
-        # reshape to the flow's natural display shape ((B, C, H, W) for grid flows,
-        # unchanged (B, C, N) for 1D fields / paths) so callers needn't reshape.
-        f = self.flow._to_data_space(z)
-        if was_training:  # leave the caller's train/eval mode as we found it
-            self.flow.train()
-        return self.flow.to_display(f).detach()
+        Each trial step forms the Euler (or Euler-Maruyama) state ``z_lo`` and the
+        Heun state ``z_hi`` from the same drift evaluations and noise draw; their gap
+        estimates the Euler local error, and the noise cancels in it, so the controller
+        tracks how fast the drift changes rather than the injected noise. ``solver``
+        picks which state to keep:
+
+        - "euler": keep ``z_lo``. ``k2`` was evaluated there, so it is reused as the
+          next ``k1`` (first-same-as-last): one drift evaluation per trial step.
+        - "heun": keep ``z_hi`` (local extrapolation): two per trial step.
+
+        One ``dt`` is shared across the batch, set by the worst sample. A rejected SDE
+        step redraws its noise (Jolicoeur-Martineau et al., 2021), which biases the
+        sampler slightly towards low-noise increments; a Brownian bridge would not.
+
+        Returns ``(z, t_min)``; step statistics go to ``self.adaptive_stats``.
+        """
+        if solver not in ("euler", "heun"):
+            raise ValueError(
+                f"Adaptive integration supports solver='euler' or 'heun', got {solver}."
+            )
+
+        def as_t(t):
+            return torch.as_tensor(t, device=self.device, dtype=z.dtype)
+
+        # SDE steps carry a decay, a doubled drift and noise; the ODE has none of these.
+        drift_scale = 2.0 if sde else 1.0
+        safety, min_factor, max_factor = 0.9, 0.2, 5.0
+        t, dt = 1.0, 1e-2
+        k1 = compute_drift(z, as_t(t))
+        nfe, accepted, rejected = 1, 0, 0
+        ts = [t]
+        # Progress is the fraction of [t_min, 1] covered; the step count isn't known
+        # up front, so report the controller's state alongside instead.
+        pbar = tqdm(
+            total=1.0 - t_min,
+            desc=f"adaptive {solver} {'SDE' if sde else 'ODE'}",
+            bar_format="{desc}: {percentage:3.0f}%|{bar}| {elapsed}<{remaining}{postfix}",
+            disable=not verbose,
+        )
+        while t > t_min:
+            if accepted + rejected >= max_steps:
+                raise RuntimeError(
+                    f"Adaptive integration hit max_steps={max_steps} trial steps at "
+                    f"t={t:.3e}; loosen rtol/atol, raise t_min or raise max_steps."
+                )
+            dt = min(dt, t - t_min)
+            # Snap the last step onto t_min so rounding can't leave a sliver behind.
+            t_next = t_min if dt == t - t_min else t - dt
+            if sde:
+                decay, noise_std = self._vp_step_coeffs(as_t(t), as_t(dt))
+                base = decay * z + noise_std * torch.randn_like(z)
+            else:
+                base = z
+            z_lo = base - drift_scale * dt * k1
+            k2 = compute_drift(z_lo, as_t(t_next))
+            nfe += 1
+            z_hi = base - drift_scale * dt * (k1 + k2) / 2
+
+            err = z_hi - z_lo
+            scale = atol + rtol * torch.maximum(z.abs(), z_lo.abs())
+            err_norm = (err / scale).pow(2).flatten(1).mean(1).sqrt().max().item()
+
+            if err_norm <= 1.0:
+                # Set progress from t itself, so summed dt rounding can't overshoot.
+                pbar.update(min(1.0 - t_next, pbar.total) - pbar.n)
+                t = t_next
+                accepted += 1
+                ts.append(t)
+                if solver == "euler" and corrector is None:
+                    z, k1 = z_lo, k2
+                else:
+                    # Heun's state, or a corrector move, leaves the cached drift stale.
+                    z = z_lo if solver == "euler" else z_hi
+                    if corrector is not None:
+                        z = corrector(z, as_t(t))
+                    if t > t_min:
+                        k1 = compute_drift(z, as_t(t))
+                        nfe += 1
+            else:
+                rejected += 1
+
+            # Euler's local error is O(dt^2), hence the 1/2 exponent.
+            factor = safety * err_norm**-0.5 if err_norm > 0 else max_factor
+            dt *= min(max(factor, min_factor), max_factor)
+            # refresh=False: tqdm redraws on the next update(), rate-limited.
+            pbar.set_postfix_str(
+                f"t={t:.2e}, dt={dt:.1e}, nfe={nfe}, rej={rejected}", refresh=False
+            )
+        pbar.close()
+
+        self.adaptive_stats = {
+            "nfe": nfe,
+            "accepted": accepted,
+            "rejected": rejected,
+            "ts": torch.tensor(ts),
+        }
+        print(
+            f"Adaptive {solver} ({'SDE' if sde else 'ODE'}): {nfe} drift evals, "
+            f"{accepted} accepted / {rejected} rejected steps to t={t:.1e}"
+        )
+        return z, as_t(t)
