@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="flow_inference">
+<rect width="64" height="64" rx="12" fill="#2d1e69"/>
+<circle cx="32" cy="32" r="22" fill="none" stroke="#a99df0" stroke-width="3"/>
+<circle cx="32" cy="32" r="16.1" fill="none" stroke="#de6fa1" stroke-width="3.4"/>
+<circle cx="32" cy="32" r="10.6" fill="none" stroke="#f97b3d" stroke-width="3.4"/>
+<g transform="translate(32 32)">
+<path d="M 0,-8.4 C 1.85,-1.85 1.85,-1.85 8.4,0 C 1.85,1.85 1.85,1.85 0,8.4 C -1.85,1.85 -1.85,1.85 -8.4,0 C -1.85,-1.85 -1.85,-1.85 0,-8.4 Z" fill="#ffd23f" transform="rotate(45)"/>
+<path d="M 0,-6.2 C 1.36,-1.36 1.36,-1.36 6.2,0 C 1.36,1.36 1.36,1.36 0,6.2 C -1.36,1.36 -1.36,1.36 -6.2,0 C -1.36,-1.36 -1.36,-1.36 0,-6.2 Z" fill="#ffffff"/>
+</g>
+</svg>

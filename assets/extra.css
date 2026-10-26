@@ -1,0 +1,26 @@
+/* Docs-site palette and type, matched to henrymoss.github.io. */
+:root,
+[data-md-color-scheme="default"] {
+  --md-primary-fg-color: #2d1e69;
+  --md-primary-fg-color--light: #5245c8;
+  --md-primary-fg-color--dark: #1f1449;
+  --md-accent-fg-color: #de6fa1;
+  --md-typeset-a-color: #5245c8;
+  --md-text-font-family: Helvetica, Arial, "Helvetica Neue", sans-serif;
+  --md-code-font-family: "SFMono-Regular", Consolas, Menlo, monospace;
+}
+
+[data-md-color-scheme="slate"] {
+  --md-primary-fg-color: #2d1e69;
+  --md-accent-fg-color: #f97b3d;
+  --md-typeset-a-color: #a99df0;
+}
+
+body {
+  font-family: var(--md-text-font-family);
+}
+
+/* Home page: the logo stands in for the title (see scripts/build_docs.py). */
+.md-typeset h1.hidden-title {
+  display: none;
+}
