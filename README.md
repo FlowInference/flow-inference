@@ -57,22 +57,29 @@ samples = IntegratorSampler(flow).sample(16, guidance=guidance, num_steps=500)
 To condition on data as well, build the flow from a GP posterior instead:
 `mean, kernel = gp_posterior(kernel, X, y)` from `flow_inference.gp_utils`.
 
-## Package layout
 
-| Module | Contents |
-|---|---|
-| `flows` | The flows to sample from: `GaussianFlow`, `GaussianProcessFlow` (function space), `BasisGaussianProcessFlow` (weight space), `GaussianIncrementFlow`, `NeuralFlow` (learned) |
-| `conditions` | What samples should satisfy: `EqualityCondition` (residuals), `BinaryCondition` (inequalities), `PointWiseCondition`, `ProductCondition` |
-| `guidance` | How the condition steers sampling: `GuidanceDPS`, `GuidanceMPGD`, `GuidanceMC`, `GuidanceMCFisher`, `GuidanceEnsembleKalman` |
-| `sampler` | `IntegratorSampler` (ODE/SDE integration) and `PCNCorrector` (gradient-free MCMC correction) |
-| `mcmc` | Baselines on the same latent target, run directly on the N(0, I) innovations: preconditioned Crank–Nicolson (`pcn`), elliptical slice sampling (`elliptical_slice`), Hamiltonian Monte Carlo (`hmc`) and likelihood-tempered SMC (`tempered_smc`, which also estimates the evidence) |
-| `gp_utils` | GP posteriors, kernel fitting, and random-Fourier-feature bases |
-| `maps`, `training_samplers` | Non-Gaussian spatial processes (Student-t, Brown–Resnick, Lévy–NIG, ...) as maps from Gaussian noise, and the training data they provide for `NeuralFlow` |
-| `schedules`, `flow_utils` | Noise schedules and grid helpers |
+## Related papers
+
+The methods in this library are developed in:
+
+- **Conditioning Gaussian Processes on Almost Anything.** H. Moss, L. Astfalck,
+  T. Cowperthwaite, C. Doumont, S. Willis, P. Hennig, C. Nemeth, A. Zammit-Mangion.
+  NeurIPS 2026. [arXiv:2605.21041](https://arxiv.org/abs/2605.21041)
+- **LatentFlow: A General Framework for Conditioning Stochastic Processes.**
+  L. Sharrock, L. Astfalck, H. Moss. Preprint, 2026.
+  [arXiv:2607.12922](https://arxiv.org/abs/2607.12922)
+- **Feature Space Adaptation for Effortless Gaussian Process Flows.**
+  T. Cowperthwaite, L. Sharrock, L. Astfalck, H. Moss. Preprint, 2026.
+  [arXiv:2610.11459](https://arxiv.org/abs/2610.11459)
+- **Spatial Prediction with Guided Diffusion.** A. Zammit-Mangion, L. Astfalck,
+  R. Huser, C. Nemeth, H. B. Moss. Preprint, 2026.
+  [arXiv:2610.12967](https://arxiv.org/abs/2610.12967)
 
 ## Examples
 
-Each notebook in [`examples/`](examples/) is self-contained.
+Each notebook in [`examples/`](examples/) is self-contained. They are committed without
+outputs; rendered versions with all figures are at
+<https://flowinference.github.io/flow-inference/>.
 
 | Notebook | Condition | Problem |
 |---|---|---|
@@ -92,13 +99,18 @@ Each notebook in [`examples/`](examples/) is self-contained.
 | [FitzHugh_Nagumo_excitable_medium](examples/spatio_temporal_processes/FitzHugh_Nagumo_excitable_medium.ipynb) | Pacemaker firing patterns | Stochastic FitzHugh–Nagumo medium |
 | [Stochastic_Allen_Cahn_phase_field](examples/spatio_temporal_processes/Stochastic_Allen_Cahn_phase_field.ipynb) | Sensors and final-field region means | Stochastic Allen–Cahn phase field |
 
-## Benchmarks
+## Package layout
 
-[`scripts/benchmark_innovation_space.py`](scripts/benchmark_innovation_space.py) compares guided-flow sampling with pCN, elliptical slice sampling, HMC and tempered SMC on the same latent target. LatentFlow runs first (1,000 steps, one Monte Carlo sample per step by default), and the total likelihood evaluations it spends become every other method's budget: MCMC splits it across a few long chains (`--num-chains`, default 10) and pools thinned post-burn-in draws, and SMC uses one particle per draw. Wall time is reported too. Its default problem is a GP with noisy point observations, whose exact posterior and evidence give each method's error; `compare(flow, condition)` runs the same comparison on any flow with an N(0, I) innovation prior.
-
-```bash
-python scripts/benchmark_innovation_space.py --num-samples 500
-```
+| Module | Contents |
+|---|---|
+| `flows` | The flows to sample from: `GaussianFlow`, `GaussianProcessFlow` (function space), `BasisGaussianProcessFlow` (weight space), `GaussianIncrementFlow`, `NeuralFlow` (learned) |
+| `conditions` | What samples should satisfy: `EqualityCondition` (residuals), `BinaryCondition` (inequalities), `PointWiseCondition`, `ProductCondition` |
+| `guidance` | How the condition steers sampling: `GuidanceDPS`, `GuidanceMPGD`, `GuidanceMC`, `GuidanceMCFisher`, `GuidanceEnsembleKalman` |
+| `sampler` | `IntegratorSampler` (ODE/SDE integration) and `PCNCorrector` (gradient-free MCMC correction) |
+| `mcmc` | Baselines on the same latent target, run directly on the N(0, I) innovations: preconditioned Crank–Nicolson (`pcn`), elliptical slice sampling (`elliptical_slice`), Hamiltonian Monte Carlo (`hmc`) and likelihood-tempered SMC (`tempered_smc`, which also estimates the evidence) |
+| `gp_utils` | GP posteriors, kernel fitting, and random-Fourier-feature bases |
+| `maps`, `training_samplers` | Non-Gaussian spatial processes (Student-t, Brown–Resnick, Lévy–NIG, ...) as maps from Gaussian noise, and the training data they provide for `NeuralFlow` |
+| `schedules`, `flow_utils` | Noise schedules and grid helpers |
 
 ## Development
 
@@ -111,7 +123,16 @@ pre-commit install --install-hooks        # ruff + notebook output stripping on 
 pre-commit install --hook-type pre-push   # test suite must pass before push
 ```
 
-Notebooks are committed with their outputs stripped (via `nbstripout`).
+Notebooks are committed with their outputs stripped (via `nbstripout`). To publish the
+rendered notebooks, execute them at full budget (a GPU helps) and deploy the site to the
+`gh-pages` branch, which keeps a single commit:
+
+```bash
+pip install -e ".[examples]" --group dev --group docs
+python scripts/build_docs.py              # runs new/changed notebooks into build/docs
+mkdocs serve                              # preview locally
+mkdocs gh-deploy --force --no-history     # publish
+```
 
 ## Tests
 
@@ -124,22 +145,6 @@ pytest -m notebooks  # smoke-run every example notebook (about a minute on CPU)
 The notebook smoke tests execute each notebook with capped sampling and training
 budgets, so they check that the examples run, not that their results are good.
 
-## Related papers
-
-The methods in this library are developed in:
-
-- **Conditioning Gaussian Processes on Almost Anything.** H. Moss, L. Astfalck,
-  T. Cowperthwaite, C. Doumont, S. Willis, P. Hennig, C. Nemeth, A. Zammit-Mangion.
-  NeurIPS 2026. [arXiv:2605.21041](https://arxiv.org/abs/2605.21041)
-- **LatentFlow: A General Framework for Conditioning Stochastic Processes.**
-  L. Sharrock, L. Astfalck, H. Moss. Preprint, 2026.
-  [arXiv:2607.12922](https://arxiv.org/abs/2607.12922)
-- **Feature Space Adaptation for Effortless Gaussian Process Flows.**
-  T. Cowperthwaite, L. Sharrock, L. Astfalck, H. Moss. Preprint, 2026.
-  [arXiv:2610.11459](https://arxiv.org/abs/2610.11459)
-- **Spatial Prediction with Guided Diffusion.** A. Zammit-Mangion, L. Astfalck,
-  R. Huser, C. Nemeth, H. B. Moss. Preprint, 2026.
-  [arXiv:2610.12967](https://arxiv.org/abs/2610.12967)
 
 ## Citation
 
