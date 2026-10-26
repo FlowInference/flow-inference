@@ -1,6 +1,7 @@
 # flow_inference
 
 [![CI](https://github.com/FlowInference/flow-inference/actions/workflows/ci.yml/badge.svg)](https://github.com/FlowInference/flow-inference/actions/workflows/ci.yml)
+[![Examples](https://img.shields.io/badge/examples-rendered-blue)](https://flowinference.github.io/flow-inference/)
 
 Guided flow-based sampling of stochastic processes under user-specified conditions.
 
@@ -10,6 +11,10 @@ supply: an ODE or PDE residual, a shape constraint such as monotonicity, a point
 likelihood, and so on. It does this by integrating a probability-flow ODE (or SDE) from
 noise to the process, steering each step with a guidance term computed from the
 condition's log-likelihood.
+
+> **Want to see the examples run?** The notebooks in this repo are stored without
+> outputs. Browse them fully executed, with every figure, at
+> **<https://flowinference.github.io/flow-inference/>**.
 
 ## Installation
 
