@@ -1,9 +1,18 @@
-# flow_inference
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.svg">
+    <img src="assets/logo.svg" alt="flow_inference" width="480">
+  </picture>
+</p>
 
 [![CI](https://github.com/FlowInference/flow-inference/actions/workflows/ci.yml/badge.svg)](https://github.com/FlowInference/flow-inference/actions/workflows/ci.yml)
 [![Examples](https://img.shields.io/badge/examples-rendered-blue)](https://flowinference.github.io/flow-inference/)
 
 Guided flow-based sampling of stochastic processes under user-specified conditions.
+
+<p align="center">
+  <img src="assets/gp-flow.svg" alt="White noise flowing into Gaussian-process sample paths that pass through the observations" width="760">
+</p>
 
 `flow_inference` draws samples of a stochastic process — a Gaussian process, an SDE
 solution, or anything a neural flow can be trained on — that satisfy a condition you
@@ -11,6 +20,10 @@ supply: an ODE or PDE residual, a shape constraint such as monotonicity, a point
 likelihood, and so on. It does this by integrating a probability-flow ODE (or SDE) from
 noise to the process, steering each step with a guidance term computed from the
 condition's log-likelihood.
+
+<p align="center">
+  <img src="assets/conditions.png" alt="Four kinds of condition on a random field f(x): non-linear observation mechanisms, non-Gaussian observation noise, non-linear physical relationships, and field constraints" width="720">
+</p>
 
 > **Want to see the examples run?** The notebooks in this repo are stored without
 > outputs. Browse them fully executed, with every figure, at
@@ -158,7 +171,7 @@ repository" button exports this from [`CITATION.cff`](CITATION.cff)):
 
 ```bibtex
 @software{moss2026flowinference,
-  author  = {Moss, Henry  and Cowperthwaite, Thomas and Sharrock, Louis and Astfalck, Lachlan},
+  author  = {Moss, Henry and Astfalck, Lachlan and Cowperthwaite, Thomas and Sharrock, Louis and Zammit-Mangion Andrew},
   title   = {flow\_inference: guided flow-based sampling of stochastic processes},
   year    = {2026},
   version = {0.1.0},

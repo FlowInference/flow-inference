@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 520 120" width="520" height="120" role="img" aria-label="flow_inference">
+<title>flow_inference</title>
+<path d="M 10.0,26.3 L 13.0,37.5 L 16.0,35.8 L 19.0,22.6 L 22.0,24.5 L 25.0,23.6 L 28.0,30.5 L 31.0,27.4 L 34.0,31.8 L 37.0,22.4 L 40.0,35.3 L 43.0,29.9 L 46.0,33.1 L 49.0,31.6 L 52.0,32.1 L 55.0,34.7 L 58.0,36.2 L 61.0,35.9 L 64.0,37.3 L 67.0,39.1 L 70.0,39.8 L 73.0,41.3 C 89.0,41.3 92.0,60.0 109.0,60.0" fill="none" stroke="#5245c8" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M 10.0,52.8 L 13.0,48.8 L 16.0,58.0 L 19.0,63.1 L 22.0,67.7 L 25.0,60.7 L 28.0,56.8 L 31.0,55.9 L 34.0,63.6 L 37.0,66.5 L 40.0,61.1 L 43.0,55.8 L 46.0,57.1 L 49.0,63.9 L 52.0,60.4 L 55.0,57.3 L 58.0,59.9 L 61.0,58.7 L 64.0,59.5 L 67.0,59.7 L 70.0,59.8 L 73.0,60.1 C 89.0,60.1 92.0,60.0 109.0,60.0" fill="none" stroke="#de6fa1" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M 10.0,94.0 L 13.0,96.5 L 16.0,91.7 L 19.0,87.2 L 22.0,90.3 L 25.0,86.9 L 28.0,93.1 L 31.0,99.3 L 34.0,89.4 L 37.0,88.5 L 40.0,92.4 L 43.0,91.0 L 46.0,89.3 L 49.0,85.7 L 52.0,87.1 L 55.0,87.4 L 58.0,83.0 L 61.0,83.3 L 64.0,81.4 L 67.0,80.6 L 70.0,79.5 L 73.0,78.5 C 89.0,78.5 92.0,60.0 109.0,60.0" fill="none" stroke="#f97b3d" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/>
+<circle cx="128" cy="60" r="19" fill="none" stroke="#6052ab" stroke-width="1.9"/>
+<circle cx="128" cy="60" r="13.93" fill="none" stroke="#de6fa1" stroke-width="2.28"/>
+<circle cx="128" cy="60" r="9.18" fill="none" stroke="#f97b3d" stroke-width="2.28"/>
+<g transform="translate(128 60)"><path d="M 0,-7.28 C 1.6,-1.6 1.6,-1.6 7.28,0 C 1.6,1.6 1.6,1.6 0,7.28 C -1.6,1.6 -1.6,1.6 -7.28,0 C -1.6,-1.6 -1.6,-1.6 0,-7.28 Z" fill="#ffd23f" transform="rotate(45)"/><path d="M 0,-5.38 C 1.18,-1.18 1.18,-1.18 5.38,0 C 1.18,1.18 1.18,1.18 0,5.38 C -1.18,1.18 -1.18,1.18 -5.38,0 C -1.18,-1.18 -1.18,-1.18 0,-5.38 Z" fill="#ffffff" stroke="#2d1e69" stroke-width="0.95" stroke-linejoin="round"/></g>
+<text x="166" y="76" font-family="Helvetica, Arial, 'Helvetica Neue', sans-serif" font-size="46" font-weight="700" letter-spacing="-0.5"><tspan fill="#2d1e69">flow</tspan><tspan fill="#5245c8">_inference</tspan></text>
+</svg>
