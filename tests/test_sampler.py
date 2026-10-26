@@ -282,6 +282,99 @@ class TestIntegratorNeuralFlow:
 
 
 # ---------------------------------------------------------------------------
+# IntegratorSampler — adaptive step sizes
+# ---------------------------------------------------------------------------
+
+
+class TestIntegratorAdaptive:
+    @pytest.mark.parametrize("sde", [False, True])
+    @pytest.mark.parametrize("solver", ["euler", "heun"])
+    def test_shape_and_stats(self, gp_flow, pointwise_condition, solver, sde):
+        s = IntegratorSampler(gp_flow)
+        g = GuidanceDPS(gp_flow, pointwise_condition)
+        out = s.sample(
+            num_samples=B,
+            guidance=g,
+            adaptive=True,
+            solver=solver,
+            sde=sde,
+            t_min=1e-2,
+            verbose=False,
+        )
+        assert out.shape == (B, C, N) and torch.isfinite(out).all()
+        st = s.adaptive_stats
+        trials = st["accepted"] + st["rejected"]
+        if solver == "euler":
+            # First-same-as-last: one initial eval plus one per trial step.
+            assert st["nfe"] == 1 + trials
+        else:
+            # Heun re-evaluates at each accepted state, bar the last.
+            assert st["nfe"] == trials + st["accepted"]
+        assert st["ts"][0] == 1.0 and st["ts"][-1] == 1e-2
+        assert (st["ts"].diff() < 0).all()
+
+    @pytest.mark.parametrize("sde", [False, True])
+    def test_tighter_tolerance_takes_more_steps(
+        self, gp_flow, pointwise_condition, sde
+    ):
+        s = IntegratorSampler(gp_flow)
+        g = GuidanceDPS(gp_flow, pointwise_condition)
+        steps = []
+        for tol in (1e-1, 1e-3):
+            torch.manual_seed(0)
+            s.sample(
+                num_samples=B,
+                rtol=tol,
+                atol=tol,
+                guidance=g,
+                adaptive=True,
+                sde=sde,
+                verbose=False,
+            )
+            steps.append(s.adaptive_stats["accepted"])
+        assert steps[1] > steps[0]
+
+    def test_step_cap_raises(self, gp_flow, pointwise_condition):
+        g = GuidanceDPS(gp_flow, pointwise_condition)
+        with pytest.raises(RuntimeError, match="max_steps"):
+            IntegratorSampler(gp_flow).sample(
+                num_samples=B,
+                guidance=g,
+                adaptive=True,
+                rtol=1e-6,
+                atol=1e-6,
+                max_steps=3,
+                verbose=False,
+            )
+
+    def test_num_steps_with_adaptive_raises(self, gp_flow):
+        with pytest.raises(ValueError, match="num_steps"):
+            IntegratorSampler(gp_flow).sample(
+                num_samples=B, num_steps=50, adaptive=True, verbose=False
+            )
+
+    def test_rk4_raises(self, gp_flow):
+        with pytest.raises(ValueError, match="Adaptive"):
+            IntegratorSampler(gp_flow).sample(
+                num_samples=B, adaptive=True, solver="rk4", verbose=False
+            )
+
+    def test_with_corrector(self, gp_flow, pointwise_condition):
+        s = IntegratorSampler(gp_flow)
+        corrector = PCNCorrector(gp_flow, pointwise_condition, num_steps=1)
+        out = s.sample(
+            num_samples=B, corrector=corrector, adaptive=True, t_min=1e-2, verbose=False
+        )
+        assert torch.isfinite(out).all()
+
+    def test_neural_flow(self, neural_flow):
+        out = IntegratorSampler(neural_flow).sample(
+            num_samples=2, adaptive=True, sde=True, t_min=1e-2, verbose=False
+        )
+        assert torch.isfinite(out).all()
+
+
+# ---------------------------------------------------------------------------
 # IntegratorSampler — statistical correctness (unconditional prior recovery)
 # ---------------------------------------------------------------------------
 
