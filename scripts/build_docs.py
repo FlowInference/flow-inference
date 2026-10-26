@@ -18,6 +18,7 @@ A notebook is skipped when its executed copy is newer than the source; pass
 
 import argparse
 import re
+import shutil
 import time
 from pathlib import Path
 
@@ -51,8 +52,13 @@ def write_index() -> None:
         lambda m: f"]({REPO_URL}{m.group(1)})",
         readme,
     )
+    # The README opens with the logo, not a "#" title; give the page a hidden one so
+    # mkdocs doesn't insert a "Home" heading above the logo.
+    readme = "# flow_inference {: .hidden-title }\n\n" + readme
     DOCS.mkdir(parents=True, exist_ok=True)
     (DOCS / "index.md").write_text(readme)
+    # The README's <img>/<picture> tags use relative assets/ paths, kept as-is.
+    shutil.copytree(ROOT / "assets", DOCS / "assets", dirs_exist_ok=True)
 
 
 def main() -> None:

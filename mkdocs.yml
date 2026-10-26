@@ -13,6 +13,9 @@ site_dir: build/site
 
 theme:
   name: material
+  logo: assets/logo-mark.svg
+  favicon: assets/logo-mark.svg
+  font: false  # Helvetica, as on henrymoss.github.io (see assets/extra.css)
   features:
     - navigation.sections
     - navigation.top
@@ -29,6 +32,9 @@ theme:
         icon: material/brightness-4
         name: Switch to light mode
 
+extra_css:
+  - assets/extra.css
+
 plugins:
   - search
   - mkdocs-jupyter:
@@ -37,6 +43,7 @@ plugins:
 
 markdown_extensions:
   - admonition
+  - attr_list
   - tables
   - pymdownx.highlight
   - pymdownx.superfences
