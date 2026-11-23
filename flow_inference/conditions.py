@@ -352,7 +352,8 @@ class PointWiseCondition(EqualityCondition):
 
     Args:
         target_field: observed values, shape ``(N,)``.
-        mask: boolean mask ``(N,)`` selecting the observed points.
+        mask: boolean mask ``(N,)`` selecting the observed points; read once, at
+            construction.
         sigma: observation noise standard deviation.
         weights: optional quadrature weights (see :class:`EqualityCondition`).
     """
@@ -367,6 +368,12 @@ class PointWiseCondition(EqualityCondition):
         super().__init__(sigma=sigma, weights=weights)
         self.register_buffer("mask", mask)
         self.register_buffer("target_field", target_field)
+        # Integer indices of the observed points, fixed at construction: indexing with
+        # them avoids the host sync that boolean-mask indexing costs on the GPU (and so
+        # keeps the condition usable inside a CUDA graph).
+        index = mask.nonzero(as_tuple=False).squeeze(-1)
+        self.register_buffer("observed_index", index)
+        self.register_buffer("observed_target", target_field[index].contiguous())
 
     def residual(self, x: torch.Tensor) -> torch.Tensor:
         """Difference between the field and the target at the observed points.
@@ -392,5 +399,5 @@ class PointWiseCondition(EqualityCondition):
                 f"field width N={x.shape[-1]} does not match mask length "
                 f"{self.mask.shape[0]}"
             )
-        diff = x.squeeze(1)[:, self.mask] - self.target_field[None, self.mask]
-        return diff.unsqueeze(1)
+        observed = x.squeeze(1).index_select(1, self.observed_index)
+        return (observed - self.observed_target.to(observed)).unsqueeze(1)

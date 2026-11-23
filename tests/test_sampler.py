@@ -9,7 +9,8 @@ relative to the unconditional draw.
 import pytest
 import torch
 
-from flow_inference.guidance import GuidanceDPS
+from flow_inference.conditions import EqualityCondition, PointWiseCondition
+from flow_inference.guidance import GuidanceDPS, GuidanceMC
 from flow_inference.sampler import IntegratorSampler
 
 N = 8
@@ -435,3 +436,95 @@ class TestIntegratorGuidance:
             verbose=False,
         )
         assert guided[:, 0, :2].abs().mean() < uncond[:, 0, :2].abs().mean()
+
+
+# ---------------------------------------------------------------------------
+# CUDA graph capture of the integration step
+# ---------------------------------------------------------------------------
+
+needs_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+
+
+class TestCudaGraph:
+    def test_ignored_on_cpu(self, gp_flow):
+        torch.manual_seed(0)
+        plain = IntegratorSampler(gp_flow).sample(4, num_steps=8, verbose=False)
+        torch.manual_seed(0)
+        graphed = IntegratorSampler(gp_flow).sample(
+            4, num_steps=8, verbose=False, cuda_graph=True
+        )
+        assert torch.equal(plain, graphed)
+
+    @needs_cuda
+    @pytest.mark.parametrize("sde", [False, True])
+    @pytest.mark.parametrize("solver", ["euler", "heun"])
+    def test_matches_the_uncaptured_solve(self, gp_flow, sde, solver):
+        flow = gp_flow.to("cuda")
+        target = torch.linspace(-1, 1, flow.latent_dim, device="cuda")
+        mask = torch.zeros(flow.latent_dim, dtype=torch.bool, device="cuda")
+        mask[::4] = True
+        guidance = GuidanceMC(flow, PointWiseCondition(target, mask, sigma=0.1))
+        runs = []
+        for cuda_graph in (False, True):
+            torch.manual_seed(0)
+            runs.append(
+                IntegratorSampler(flow).sample(
+                    16,
+                    num_steps=20,
+                    guidance=guidance,
+                    sde=sde,
+                    solver=solver,
+                    verbose=False,
+                    cuda_graph=cuda_graph,
+                )
+            )
+        assert torch.allclose(runs[0], runs[1], atol=1e-6)
+
+    @needs_cuda
+    def test_falls_back_with_a_warning_when_the_step_syncs(self, gp_flow):
+        class HostSync(EqualityCondition):
+            def residual(self, x):
+                return x[:, :, :1] * float(x.abs().max())  # .item()-style host sync
+
+        flow = gp_flow.to("cuda")
+        guidance = GuidanceMC(flow, HostSync(sigma=1.0))
+        with pytest.warns(UserWarning, match="could not be captured"):
+            out = IntegratorSampler(flow).sample(
+                4, num_steps=5, guidance=guidance, verbose=False, cuda_graph=True
+            )
+        assert torch.isfinite(out).all()
+
+    @needs_cuda
+    @pytest.mark.parametrize("sde", [False, True])
+    @pytest.mark.parametrize("solver", ["euler", "heun"])
+    def test_adaptive_matches_the_uncaptured_solve(self, gp_flow, sde, solver):
+        flow = gp_flow.to("cuda")
+        target = torch.linspace(-1, 1, flow.latent_dim, device="cuda")
+        mask = torch.zeros(flow.latent_dim, dtype=torch.bool, device="cuda")
+        mask[::4] = True
+        guidance = GuidanceMC(flow, PointWiseCondition(target, mask, sigma=0.1))
+        runs, stats = [], []
+        for cuda_graph in (False, True):
+            # GuidanceMC's Monte Carlo noise is cached on the flow; clear it so both
+            # runs draw it at the same point of the random stream.
+            flow.z = None
+            torch.manual_seed(0)
+            sampler = IntegratorSampler(flow)
+            runs.append(
+                sampler.sample(
+                    16,
+                    guidance=guidance,
+                    sde=sde,
+                    solver=solver,
+                    adaptive=True,
+                    rtol=0.05,
+                    atol=0.05,
+                    verbose=False,
+                    cuda_graph=cuda_graph,
+                )
+            )
+            stats.append(sampler.adaptive_stats)
+        # Same controller decisions, same states.
+        assert stats[0]["accepted"] == stats[1]["accepted"]
+        assert stats[0]["rejected"] == stats[1]["rejected"]
+        assert torch.allclose(runs[0], runs[1], atol=1e-5)
