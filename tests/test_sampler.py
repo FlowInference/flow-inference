@@ -6,6 +6,8 @@ first two spatial points to zero, so guidance must pull those points toward zero
 relative to the unconditional draw.
 """
 
+import warnings
+
 import pytest
 import torch
 
@@ -488,11 +490,18 @@ class TestCudaGraph:
 
         flow = gp_flow.to("cuda")
         guidance = GuidanceMC(flow, HostSync(sigma=1.0))
+        sampler = IntegratorSampler(flow)
         with pytest.warns(UserWarning, match="could not be captured"):
-            out = IntegratorSampler(flow).sample(
+            out = sampler.sample(
                 4, num_steps=5, guidance=guidance, verbose=False, cuda_graph=True
             )
         assert torch.isfinite(out).all()
+        # Only once per sampler.
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", UserWarning)
+            sampler.sample(
+                4, num_steps=5, guidance=guidance, verbose=False, cuda_graph=True
+            )
 
     @needs_cuda
     @pytest.mark.parametrize("sde", [False, True])

@@ -33,6 +33,9 @@ class IntegratorSampler(nn.Module):
     def __init__(self, flow: BaseFlow):
         super().__init__()
         self.flow = flow
+        # Set once a cuda_graph capture has failed and been warned about, so that
+        # repeated calls (and the adaptive solver's two captures) warn only once.
+        self._graph_warned = False
 
     # Read from the flow so they follow .to() / .double() on it.
     @property
@@ -96,7 +99,7 @@ class IntegratorSampler(nn.Module):
         atol: float = 1e-2,
         t_min: float = 1e-3,
         max_steps: int = 10_000,
-        cuda_graph: bool = False,
+        cuda_graph: bool = True,
     ) -> torch.Tensor:
         """Draw samples by integrating the probability-flow ODE (or reverse SDE).
 
@@ -131,15 +134,26 @@ class IntegratorSampler(nn.Module):
                 ``final_denoise`` takes over.
             max_steps: adaptive only: cap on the number of trial steps (accepted and
                 rejected); reaching it raises.
-            cuda_graph: CUDA devices only: capture one integration step (drift,
+            cuda_graph: on by default; CUDA devices only (ignored on the CPU).
+                Capture one integration step (drift,
                 guidance and update) in a CUDA graph and replay it, removing the
                 per-step Python and kernel-launch overhead that dominates small
                 problems. With ``adaptive=True`` the trial step is captured and the
                 step-size controller stays in Python, reading one number per trial
                 step. The step must not synchronise with the host (no ``.item()``, no
-                boolean-mask indexing); if it cannot be captured, a warning is raised
-                and the solve runs as usual. Random draws inside the guidance stay
-                random but may differ from an uncaptured run's. Ignored on the CPU.
+                boolean-mask indexing); if it cannot be captured, the solve runs as
+                usual, with a warning the first time on this sampler. Random draws
+                inside the guidance stay random but may differ from an uncaptured
+                run's.
+
+                **Only GPU work is replayed.** The step's Python code runs once, at
+                capture, and never again: Python-side state in a custom condition or
+                guidance (a step counter, an attribute changed between calls, a
+                branch on a Python value) is frozen at its first-step value, with no
+                error, and the results are silently wrong. The library's own flows,
+                conditions and guidances keep no such state. If yours do, or if
+                in doubt, pass ``cuda_graph=False``; comparing a short run with and
+                without it is a quick check.
 
         Returns:
             Samples ``(num_samples, C, *output_shape)`` in data space, e.g.
@@ -319,9 +333,9 @@ class IntegratorSampler(nn.Module):
         replays the graph and returns ``fn``'s outputs. The outputs live in buffers that
         the next replay overwrites, so clone anything kept across replays.
 
-        Returns None, with a warning, if ``fn`` cannot be captured (for example a
-        condition or guidance that synchronises with the host); callers then run
-        eagerly. Random draws inside ``fn`` (e.g. ``GuidanceMC``) stay random across
+        Returns None if ``fn`` cannot be captured (for example a condition or guidance
+        that synchronises with the host); callers then run eagerly. The first failure
+        on this sampler warns; later ones are silent. Random draws inside ``fn`` (e.g. ``GuidanceMC``) stay random across
         replays.
         """
         tensors = [a for a in example_args if torch.is_tensor(a)]
@@ -344,11 +358,15 @@ class IntegratorSampler(nn.Module):
                 out = fn(*static)
         except RuntimeError as error:
             torch.cuda.synchronize(device)
-            warnings.warn(
-                f"cuda_graph=True, but the integration step could not be captured "
-                f"({str(error).splitlines()[0][:120]}); integrating without it.",
-                stacklevel=5,
-            )
+            if not self._graph_warned:
+                self._graph_warned = True
+                warnings.warn(
+                    f"cuda_graph=True, but the integration step could not be captured "
+                    f"({str(error).splitlines()[0][:120]}); integrating without it. "
+                    "This warning is shown once per sampler; pass cuda_graph=False "
+                    "to skip the capture attempt.",
+                    stacklevel=5,
+                )
             return None
 
         def replay(*args):

@@ -155,6 +155,25 @@ class BaseCondition(nn.Module, ABC):
             "return residual/sigma with shape (B, C, A)."
         )
 
+    def residual_and_sigma(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """The condition as Gaussian residuals with a tolerance per component.
+
+        Used by :class:`~flow_inference.guidance.GuidancePiGDM`. Unlike
+        :meth:`standardised_residual` it never divides by the tolerance, so a
+        tolerance of 0 (a hard constraint) is allowed.
+
+        Args:
+            x: flat field ``(B, C, N)``.
+
+        Returns:
+            Residuals ``(B, C, A)`` and tolerances ``(C, A)``, such that the
+            log-likelihood is ``-0.5 * sum (residual / tolerance)^2``.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not define residual_and_sigma; it is defined "
+            "for EqualityCondition and products of them."
+        )
+
 
 class ProductCondition(BaseCondition):
     """Several conditions imposed together: their log-likelihoods are summed.
@@ -192,6 +211,22 @@ class ProductCondition(BaseCondition):
         """
         return torch.cat(
             [cond.standardised_residual(x) for cond in self.conditions], dim=-1
+        )
+
+    def residual_and_sigma(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """The sub-conditions' residuals and tolerances, concatenated along the last
+        axis (see :meth:`BaseCondition.residual_and_sigma`).
+
+        Args:
+            x: flat field ``(B, C, N)``.
+
+        Returns:
+            Residuals ``(B, C, A_1 + A_2 + ...)`` and tolerances ``(C, A_1 + ...)``.
+        """
+        parts = [cond.residual_and_sigma(x) for cond in self.conditions]
+        return (
+            torch.cat([r for r, _ in parts], dim=-1),
+            torch.cat([s for _, s in parts], dim=-1),
         )
 
 
@@ -330,6 +365,31 @@ class EqualityCondition(BaseCondition):
         r = self.residual(x) / self.sigma
         w = self.quadrature_weights
         return r if w is None else r * w.to(r).sqrt()
+
+    def residual_and_sigma(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """The residual and, per component, the tolerance ``sigma / sqrt(w_a)``, so
+        that ``logp == -0.5 * sum (residual / tolerance)^2``. ``sigma = 0`` is allowed
+        here and makes the condition a hard constraint for
+        :class:`~flow_inference.guidance.GuidancePiGDM` (``logp`` itself is then
+        undefined).
+
+        Args:
+            x: flat field ``(B, C, N)``.
+
+        Returns:
+            Residuals ``(B, C, A)`` and tolerances ``(C, A)``.
+        """
+        r = self.residual(x)
+        sigma = self.sigma.to(r).expand(r.shape[1:])
+        w = self.quadrature_weights
+        if w is not None:
+            w = torch.broadcast_to(w.to(r), r.shape[1:])
+            # A zero weight drops the component: zero residual, unit tolerance
+            # (rather than an infinite tolerance, which would poison the solve).
+            keep = w > 0
+            r = torch.where(keep, r, torch.zeros_like(r))
+            sigma = torch.where(keep, sigma / w.sqrt(), torch.ones_like(sigma))
+        return r, sigma
 
     @abstractmethod
     def residual(self, x: torch.Tensor) -> torch.Tensor:

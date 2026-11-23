@@ -36,7 +36,12 @@ from flow_inference.flows import (
     NeuralFlow,
 )
 from flow_inference.gp_utils import fit_kernel_hyperparameters, gp_posterior
-from flow_inference.guidance import GuidanceDPS, GuidanceMC, GuidanceMPGD
+from flow_inference.guidance import (
+    GuidanceDPS,
+    GuidanceMC,
+    GuidanceMPGD,
+    GuidancePiGDM,
+)
 from flow_inference.sampler import IntegratorSampler
 
 try:
@@ -56,6 +61,7 @@ __all__ = [
     "GuidanceDPS",
     "GuidanceMC",
     "GuidanceMPGD",
+    "GuidancePiGDM",
     "IntegratorSampler",
     "NeuralFlow",
     "PointWiseCondition",
