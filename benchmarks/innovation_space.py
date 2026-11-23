@@ -1,12 +1,13 @@
 """Benchmark guided-flow sampling against innovation-space baselines.
 
-Compares LatentFlow (``IntegratorSampler`` with ``GuidanceMC``) with classical
-methods on the same latent target: preconditioned Crank–Nicolson and its gradient
-version pCN-MALA, elliptical slice sampling, Hamiltonian Monte Carlo, NUTS,
-likelihood-tempered SMC (with pCN or elliptical-slice moves), and expectation
-propagation. The MCMC and SMC methods get the same number of likelihood evaluations
-per draw as LatentFlow spends (999 with the default 1,000 steps and one Monte Carlo
-sample per step); EP sets its own cost.
+Compares LatentFlow (``IntegratorSampler`` with ``GuidanceMC``) and the library's
+noise-aware Pi-GDM guidance (``GuidancePiGDM``) with classical methods on the
+same latent target: preconditioned Crank–Nicolson and its gradient version pCN-MALA,
+elliptical slice sampling, Hamiltonian Monte Carlo, NUTS, likelihood-tempered SMC
+(with pCN or elliptical-slice moves), and expectation propagation. The MCMC and SMC
+methods get the same number of likelihood evaluations per draw as LatentFlow spends
+(999 with the default 1,000 steps and one Monte Carlo sample per step); Pi-GDM
+guidance and EP set their own cost.
 
 :func:`compare` works for any flow with an ``N(0, I)`` innovation prior and any
 condition. The script's default problem is a 1D GP observed with Gaussian noise,
@@ -39,7 +40,7 @@ from benchmarks.mcmc import (
 from flow_inference.conditions import PointWiseCondition
 from flow_inference.flow_utils import float64_copy
 from flow_inference.flows import GaussianProcessFlow
-from flow_inference.guidance import GuidanceMC
+from flow_inference.guidance import GuidanceMC, GuidancePiGDM
 from flow_inference.sampler import IntegratorSampler
 
 
@@ -83,14 +84,71 @@ def run_latentflow(flow, condition, num_samples, num_steps, num_mc_samples):
     _sync(flow.device)
     start = time.perf_counter()
     with counting_evaluations(condition) as counter:
+        # No CUDA graph: a replayed step would skip the Python counter, and the
+        # count sets every other method's budget.
         samples = sampler.sample(
-            num_samples, guidance=guidance, num_steps=num_steps, verbose=False, sde=True
+            num_samples,
+            guidance=guidance,
+            num_steps=num_steps,
+            verbose=False,
+            sde=True,
+            cuda_graph=False,
         )
     _sync(flow.device)
     return {
         "samples": samples.detach(),
         "seconds": time.perf_counter() - start,
         "evals": counter["evals"],
+    }
+
+
+def run_pigdm(flow, condition, num_samples, num_steps, num_iterations=1, lsmr_iters=20):
+    """Draw independent samples with :class:`~flow_inference.guidance.GuidancePiGDM`.
+
+    It chooses its own cost: ``num_steps`` ODE steps (it needs far fewer than the
+    single-point guidances), each linearising the condition's residual
+    ``num_iterations`` times and taking ``2 * lsmr_iters`` Jacobian products per
+    linearisation.
+
+    Returns:
+        A run dict with the ``samples``, wall-clock ``seconds``, ``evals`` (residual
+        evaluations: one per linearisation and draw, the Jacobian products not
+        counted) and ``stats``.
+    """
+    guidance = GuidancePiGDM(
+        flow, condition, num_iterations=num_iterations, lsmr_iters=lsmr_iters
+    ).to(flow.device)
+    counter = {"evals": 0}
+    original = condition.residual_and_sigma
+
+    def residual_and_sigma(x):
+        counter["evals"] += x.shape[0]
+        return original(x)
+
+    condition.residual_and_sigma = residual_and_sigma
+    try:
+        _sync(flow.device)
+        start = time.perf_counter()
+        samples = IntegratorSampler(flow).sample(
+            num_samples,
+            guidance=guidance,
+            num_steps=num_steps,
+            verbose=False,
+            cuda_graph=False,  # a replayed step would skip the Python counter
+        )
+        _sync(flow.device)
+        seconds = time.perf_counter() - start
+    finally:
+        del condition.residual_and_sigma
+    return {
+        "samples": samples.detach(),
+        "seconds": seconds,
+        "evals": counter["evals"],
+        "stats": {
+            "steps": num_steps,
+            "iterations": num_iterations,
+            "lsmr_iters": lsmr_iters,
+        },
     }
 
 
@@ -219,6 +277,7 @@ def compare(
     nuts_burn_in=200,
     reference=None,
     methods=None,
+    pigdm_steps=50,
 ):
     """Run every method on LatentFlow's budget and print a comparison table.
 
@@ -240,6 +299,9 @@ def compare(
       further moves at ``beta = 1`` until the budget is spent. Tempering always
       finishes, so too many moves per stage overrun the budget; the table shows the
       evaluations actually spent;
+    * Pi-GDM guidance: sets its own cost, ``pigdm_steps`` ODE steps (it needs far
+      fewer than LatentFlow); the table counts its residual evaluations, not the
+      Jacobian products each one is followed by;
     * EP: sets its own cost. It is a Gaussian approximation rather than a sampler,
       and applies only to conditions with affine sites (it is skipped otherwise).
 
@@ -261,6 +323,7 @@ def compare(
             shows each method's mean absolute error in the mean and standard
             deviation, and the evidence error of the methods that estimate it.
         methods: a subset of :data:`METHODS` to run; all by default.
+        pigdm_steps: integration steps for Pi-GDM guidance.
 
     Returns:
         The runs, ``{method: run}``.
@@ -277,6 +340,7 @@ def compare(
         smc_ess_moves,
         methods=METHODS if methods is None else methods,
         nuts_burn_in=nuts_burn_in,
+        pigdm_steps=pigdm_steps,
     )
     print(
         f"budget: {per_draw} likelihood evaluations per draw, {num_samples} draws; "
@@ -288,6 +352,7 @@ def compare(
 
 METHODS = (
     "LatentFlow",
+    "Pi-GDM guidance",
     "pCN",
     "pCN-MALA",
     "elliptical slice",
@@ -311,6 +376,7 @@ def run_all(
     smc_ess_moves,
     methods=METHODS,
     nuts_burn_in=200,
+    pigdm_steps=50,
 ):
     """Run ``methods`` on LatentFlow's budget (see :func:`compare`), without printing.
 
@@ -335,6 +401,7 @@ def run_all(
             flow, condition, num_samples, num_chains, budget, nuts_burn_in
         ),
         "EP": lambda: run_ep(flow, condition, num_samples),
+        "Pi-GDM guidance": lambda: run_pigdm(flow, condition, num_samples, pigdm_steps),
         "elliptical slice": lambda: run_mcmc(
             elliptical_slice,
             *mcmc,
@@ -480,6 +547,9 @@ if __name__ == "__main__":
         "--nuts-burn-in", type=int, default=200, help="NUTS adaptation iterations"
     )
     parser.add_argument(
+        "--pigdm-steps", type=int, default=50, help="Pi-GDM guidance steps"
+    )
+    parser.add_argument(
         "--methods",
         nargs="+",
         default=list(METHODS),
@@ -503,6 +573,7 @@ if __name__ == "__main__":
         args.smc_moves,
         args.smc_ess_moves,
         nuts_burn_in=args.nuts_burn_in,
+        pigdm_steps=args.pigdm_steps,
         reference=reference,
         methods=args.methods,
     )

@@ -130,8 +130,8 @@ all figures, are at <https://flowinference.github.io/flow-inference/>.
 |---|---|
 | `flows` | The flows to sample from: `GaussianFlow`, `GaussianProcessFlow` (function space), `BasisGaussianProcessFlow` (weight space), `GaussianIncrementFlow`, `NeuralFlow` (learned) |
 | `conditions` | What samples should satisfy: `EqualityCondition` (residuals), `BinaryCondition` (inequalities), `PointWiseCondition`, `ProductCondition` |
-| `guidance` | How the condition steers sampling: `GuidanceDPS`, `GuidanceMPGD`, `GuidanceMC` |
-| `sampler` | `IntegratorSampler` (ODE/SDE integration) |
+| `guidance` | How the condition steers sampling: `GuidanceDPS`, `GuidanceMPGD`, `GuidanceMC`, and `GuidancePiGDM` (noise-aware, for Gaussian-residual conditions such as observations and ODE/PDE residuals; bounded however sharp the condition, so it needs no clipping and few steps) |
+| `sampler` | `IntegratorSampler` (ODE/SDE integration, fixed or adaptive steps; on a GPU each step is replayed from a CUDA graph by default, 2-4x faster on small problems) |
 | `gp_utils` | GP posteriors, kernel fitting, and random-Fourier-feature bases |
 | `maps`, `training_samplers` | Non-Gaussian spatial processes (Student-t, Brown–Resnick, Lévy–NIG, ...) as maps from Gaussian noise, and the training data they provide for `NeuralFlow` |
 | `schedules`, `flow_utils` | Noise schedules and grid helpers |

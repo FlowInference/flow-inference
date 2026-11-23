@@ -7,6 +7,8 @@ be fixed (Euler, Heun or RK4 on a chosen time grid) or chosen adaptively from an
 estimate.
 """
 
+import warnings
+
 import torch
 import torch.nn as nn
 from tqdm.auto import tqdm
@@ -31,6 +33,9 @@ class IntegratorSampler(nn.Module):
     def __init__(self, flow: BaseFlow):
         super().__init__()
         self.flow = flow
+        # Set once a cuda_graph capture has failed and been warned about, so that
+        # repeated calls (and the adaptive solver's two captures) warn only once.
+        self._graph_warned = False
 
     # Read from the flow so they follow .to() / .double() on it.
     @property
@@ -94,6 +99,7 @@ class IntegratorSampler(nn.Module):
         atol: float = 1e-2,
         t_min: float = 1e-3,
         max_steps: int = 10_000,
+        cuda_graph: bool = True,
     ) -> torch.Tensor:
         """Draw samples by integrating the probability-flow ODE (or reverse SDE).
 
@@ -128,6 +134,26 @@ class IntegratorSampler(nn.Module):
                 ``final_denoise`` takes over.
             max_steps: adaptive only: cap on the number of trial steps (accepted and
                 rejected); reaching it raises.
+            cuda_graph: on by default; CUDA devices only (ignored on the CPU).
+                Capture one integration step (drift,
+                guidance and update) in a CUDA graph and replay it, removing the
+                per-step Python and kernel-launch overhead that dominates small
+                problems. With ``adaptive=True`` the trial step is captured and the
+                step-size controller stays in Python, reading one number per trial
+                step. The step must not synchronise with the host (no ``.item()``, no
+                boolean-mask indexing); if it cannot be captured, the solve runs as
+                usual, with a warning the first time on this sampler. Random draws
+                inside the guidance stay random but may differ from an uncaptured
+                run's.
+
+                **Only GPU work is replayed.** The step's Python code runs once, at
+                capture, and never again: Python-side state in a custom condition or
+                guidance (a step counter, an attribute changed between calls, a
+                branch on a Python value) is frozen at its first-step value, with no
+                error, and the results are silently wrong. The library's own flows,
+                conditions and guidances keep no such state. If yours do, or if
+                in doubt, pass ``cuda_graph=False``; comparing a short run with and
+                without it is a quick check.
 
         Returns:
             Samples ``(num_samples, C, *output_shape)`` in data space, e.g.
@@ -170,6 +196,7 @@ class IntegratorSampler(nn.Module):
                 atol,
                 t_min,
                 verbose,
+                cuda_graph,
             )
         else:
             z, t_last = self._integrate_fixed(
@@ -181,6 +208,7 @@ class IntegratorSampler(nn.Module):
                 sde,
                 final_denoise,
                 verbose,
+                cuda_graph,
             )
 
         if final_denoise:
@@ -204,6 +232,7 @@ class IntegratorSampler(nn.Module):
         sde,
         final_denoise,
         verbose,
+        cuda_graph=False,
     ):
         """Integrate on a fixed time grid.
 
@@ -212,31 +241,29 @@ class IntegratorSampler(nn.Module):
         """
         ts = self._get_time_schedule(num_steps, time_schedule)
 
-        if sde:
-            # One randn call for all steps, rather than a kernel launch per step.
-            all_noise = torch.randn(
-                num_steps, *z.shape, device=self.device, dtype=z.dtype
-            )
-            noise_iter = iter(all_noise)
+        # One randn call for all steps, rather than a kernel launch per step.
+        all_noise = (
+            torch.randn(num_steps, *z.shape, device=self.device, dtype=z.dtype)
+            if sde
+            else None
+        )
 
         if solver == "euler":
             if sde:
                 # Euler-Maruyama for the reverse VP SDE (see _vp_step_coeffs).
-                def step_fn(z, t_curr, t_next, dt):
+                def step_fn(z, t_curr, t_next, dt, noise):
                     drift = compute_drift(z, t_curr)
-                    noise = next(noise_iter)
                     decay, noise_std = self._vp_step_coeffs(t_curr, dt)
                     return decay * z - dt * 2.0 * drift + noise_std * noise
             else:
 
-                def step_fn(z, t_curr, t_next, dt):
+                def step_fn(z, t_curr, t_next, dt, noise):
                     return z - dt * compute_drift(z, t_curr)
         elif solver == "heun":
             if sde:
                 # Stochastic Heun: an Euler-Maruyama predictor, then the trapezoidal
                 # rule on the drift with the same noise draw and decay.
-                def step_fn(z, t_curr, t_next, dt):
-                    noise = next(noise_iter)
+                def step_fn(z, t_curr, t_next, dt, noise):
                     decay, noise_std = self._vp_step_coeffs(t_curr, dt)
                     k1 = compute_drift(z, t_curr)
                     z_hat = decay * z - dt * 2.0 * k1 + noise_std * noise
@@ -244,7 +271,7 @@ class IntegratorSampler(nn.Module):
                     return decay * z - dt * (k1 + k2) + noise_std * noise
             else:
 
-                def step_fn(z, t_curr, t_next, dt):
+                def step_fn(z, t_curr, t_next, dt, noise):
                     k1 = compute_drift(z, t_curr)
                     k2 = compute_drift(z - dt * k1, t_next)
                     return z - dt * (k1 + k2) / 2
@@ -257,7 +284,7 @@ class IntegratorSampler(nn.Module):
                 )
             else:
 
-                def step_fn(z, t_curr, t_next, dt):
+                def step_fn(z, t_curr, t_next, dt, noise):
                     t_mid = (t_curr + t_next) / 2
                     k1 = compute_drift(z, t_curr)
                     k2 = compute_drift(z - (dt / 2) * k1, t_mid)
@@ -273,12 +300,85 @@ class IntegratorSampler(nn.Module):
         # ts[-2] in place of the stiff last step. At ts[-1] ~ 0 the denoiser would do
         # nothing (alpha_t -> 1, sigma_t -> 0).
         last_step = num_steps - 1 if final_denoise else num_steps
+        if cuda_graph and z.is_cuda and last_step > 0:
+            noise0 = torch.zeros_like(z) if all_noise is None else all_noise[0]
+            replay = self._cuda_graph(
+                lambda z_, t_, tn_, noise_: step_fn(
+                    z_, t_, tn_, t_ - tn_, None if all_noise is None else noise_
+                ),
+                z,
+                ts[0],
+                ts[1],
+                noise0,
+            )
+            if replay is not None:
+                for i in tqdm(range(last_step), disable=not verbose):
+                    noise = noise0 if all_noise is None else all_noise[i]
+                    z = replay(z, ts[i], ts[i + 1], noise)
+                return z.clone(), ts[last_step]
         for i in tqdm(range(last_step), disable=not verbose):
             t_curr = ts[i]
             t_next = ts[i + 1]
             dt = t_curr - t_next  # positive: time runs backwards
-            z = step_fn(z, t_curr, t_next, dt)
+            noise = None if all_noise is None else all_noise[i]
+            z = step_fn(z, t_curr, t_next, dt, noise)
         return z, ts[last_step]
+
+    def _cuda_graph(self, fn, *example_args):
+        """Capture ``fn(*args)`` in a CUDA graph.
+
+        ``example_args`` are tensors or Python floats; they set the shapes and dtypes of
+        the graph's static input buffers. Returns ``replay(*args)``, which copies the
+        new arguments into those buffers (floats by a fill, so no host transfer),
+        replays the graph and returns ``fn``'s outputs. The outputs live in buffers that
+        the next replay overwrites, so clone anything kept across replays.
+
+        Returns None if ``fn`` cannot be captured (for example a condition or guidance
+        that synchronises with the host); callers then run eagerly. The first failure
+        on this sampler warns; later ones are silent. Random draws inside ``fn`` (e.g. ``GuidanceMC``) stay random across
+        replays.
+        """
+        tensors = [a for a in example_args if torch.is_tensor(a)]
+        device, dtype = tensors[0].device, tensors[0].dtype
+        static = [
+            a.detach().clone()
+            if torch.is_tensor(a)
+            else torch.tensor(a, device=device, dtype=dtype)
+            for a in example_args
+        ]
+        try:
+            side = torch.cuda.Stream(device=device)
+            side.wait_stream(torch.cuda.current_stream(device))
+            with torch.cuda.stream(side):
+                for _ in range(2):  # warm up allocators and autograd
+                    fn(*static)
+            torch.cuda.current_stream(device).wait_stream(side)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                out = fn(*static)
+        except RuntimeError as error:
+            torch.cuda.synchronize(device)
+            if not self._graph_warned:
+                self._graph_warned = True
+                warnings.warn(
+                    f"cuda_graph=True, but the integration step could not be captured "
+                    f"({str(error).splitlines()[0][:120]}); integrating without it. "
+                    "This warning is shown once per sampler; pass cuda_graph=False "
+                    "to skip the capture attempt.",
+                    stacklevel=5,
+                )
+            return None
+
+        def replay(*args):
+            for buf, a in zip(static, args, strict=True):
+                if torch.is_tensor(a):
+                    buf.copy_(a)
+                else:
+                    buf.fill_(a)
+            graph.replay()
+            return out
+
+        return replay
 
     def _integrate_adaptive(
         self,
@@ -291,6 +391,7 @@ class IntegratorSampler(nn.Module):
         atol,
         t_min,
         verbose,
+        cuda_graph=False,
     ):
         """Integrate from t=1 to ``t_min`` with error-controlled step sizes.
 
@@ -311,6 +412,10 @@ class IntegratorSampler(nn.Module):
         Step statistics (drift evaluations, accepted and rejected steps, and the
         accepted times) are stored in ``self.adaptive_stats``.
 
+        With ``cuda_graph`` (on a CUDA device), each trial step (the drift, both
+        states and the error norm) is replayed from a CUDA graph; the controller stays
+        in Python and reads one number per trial step.
+
         Returns:
             The final state ``z`` and the time reached, ``t_min``.
         """
@@ -327,6 +432,31 @@ class IntegratorSampler(nn.Module):
         safety, min_factor, max_factor = 0.9, 0.2, 5.0
         t, dt = 1.0, 1e-2
         k1 = compute_drift(z, as_t(t))
+
+        def trial(z, k1, t, dt, t_next, noise):
+            """One trial step: the Euler and Heun states, the drift at the Euler
+            state, and the error norm (worst sample). The SDE noise is drawn by the
+            caller, outside any CUDA graph, so captured and uncaptured runs see the
+            same draws."""
+            if sde:
+                decay, noise_std = self._vp_step_coeffs(t, dt)
+                base = decay * z + noise_std * noise
+            else:
+                base = z
+            z_lo = base - drift_scale * dt * k1
+            k2 = compute_drift(z_lo, t_next)
+            z_hi = base - drift_scale * dt * (k1 + k2) / 2
+            scale = atol + rtol * torch.maximum(z.abs(), z_lo.abs())
+            err_norm = ((z_hi - z_lo) / scale).pow(2).flatten(1).mean(1).sqrt().max()
+            return z_lo, z_hi, k2, err_norm
+
+        run_trial, run_drift = None, None
+        if cuda_graph and z.is_cuda:
+            run_trial = self._cuda_graph(
+                trial, z, k1, t, dt, t - dt, torch.zeros_like(z)
+            )
+            if run_trial is not None and solver == "heun":
+                run_drift = self._cuda_graph(compute_drift, z, t)
         nfe, accepted, rejected = 1, 0, 0
         ts = [t]
         # The step count isn't known up front, so the bar shows the fraction of
@@ -346,19 +476,15 @@ class IntegratorSampler(nn.Module):
             dt = min(dt, t - t_min)
             # Snap the last step onto t_min so rounding can't leave a sliver behind.
             t_next = t_min if dt == t - t_min else t - dt
-            if sde:
-                decay, noise_std = self._vp_step_coeffs(as_t(t), as_t(dt))
-                base = decay * z + noise_std * torch.randn_like(z)
+            noise = torch.randn_like(z) if sde else z
+            if run_trial is None:
+                z_lo, z_hi, k2, err = trial(
+                    z, k1, as_t(t), as_t(dt), as_t(t_next), noise
+                )
             else:
-                base = z
-            z_lo = base - drift_scale * dt * k1
-            k2 = compute_drift(z_lo, as_t(t_next))
+                z_lo, z_hi, k2, err = run_trial(z, k1, t, dt, t_next, noise)
             nfe += 1
-            z_hi = base - drift_scale * dt * (k1 + k2) / 2
-
-            err = z_hi - z_lo
-            scale = atol + rtol * torch.maximum(z.abs(), z_lo.abs())
-            err_norm = (err / scale).pow(2).flatten(1).mean(1).sqrt().max().item()
+            err_norm = err.item()  # the one host sync per trial step
 
             if err_norm <= 1.0:
                 # Set progress from t itself, so summed dt rounding can't overshoot.
@@ -366,13 +492,19 @@ class IntegratorSampler(nn.Module):
                 t = t_next
                 accepted += 1
                 ts.append(t)
+                # Clone: with cuda_graph these are the graph's output buffers, which
+                # the next trial overwrites even if it is rejected.
                 if solver == "euler":
-                    z, k1 = z_lo, k2
+                    z, k1 = z_lo.clone(), k2.clone()
                 else:
                     # Heun's state leaves the cached drift stale.
-                    z = z_hi
+                    z = z_hi.clone()
                     if t > t_min:
-                        k1 = compute_drift(z, as_t(t))
+                        k1 = (
+                            compute_drift(z, as_t(t))
+                            if run_drift is None
+                            else run_drift(z, t).clone()
+                        )
                         nfe += 1
             else:
                 rejected += 1

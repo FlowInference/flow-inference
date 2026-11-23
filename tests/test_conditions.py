@@ -448,9 +448,12 @@ class TestQuadratureWeights:
             def residual(self, x):
                 return (x[:, 0] @ self.weights.T).unsqueeze(1)
 
+        torch.manual_seed(0)
         x = torch.randn(B, 1, N)
         expected = -0.5 * 0.5 * ((x[:, 0] @ torch.ones(N, 3)) ** 2).sum(-1)
-        assert torch.allclose(Regions().logp(x), expected, rtol=1e-5)
+        # An absolute tolerance too: when a residual is near zero, float32 rounding is
+        # a large relative error on a tiny value. A mishandled weight would be off by 2x.
+        assert torch.allclose(Regions().logp(x), expected, rtol=1e-5, atol=1e-5)
 
     def test_weights_follow_dtype_and_state_dict(self, pointwise):
         cond = PointWiseCondition(
@@ -490,3 +493,30 @@ class TestQuadratureWeights:
             assert weighted == pytest.approx(per_unit * (n - 1) / n, rel=1e-4)
             unweighted.append(_Increasing(v=v).logp(f).item())
         assert unweighted[2] / unweighted[0] == pytest.approx(1023 / 63, rel=1e-4)
+
+
+class TestPointWiseIndexing:
+    def test_index_path_matches_boolean_mask(self):
+        torch.manual_seed(0)
+        target = torch.randn(N)
+        mask = torch.rand(N) > 0.5
+        cond = PointWiseCondition(target, mask, sigma=0.3)
+        x = torch.randn(B, 1, N)
+        expected = (x[:, 0, mask] - target[mask]).unsqueeze(1)
+        assert torch.equal(cond.residual(x), expected)
+        assert cond.observed_index.dtype == torch.long
+
+    def test_empty_and_full_masks(self):
+        x = torch.randn(B, 1, N)
+        empty = PointWiseCondition(torch.zeros(N), torch.zeros(N, dtype=torch.bool))
+        full = PointWiseCondition(torch.zeros(N), torch.ones(N, dtype=torch.bool))
+        assert empty.residual(x).shape == (B, 1, 0)
+        assert torch.equal(full.residual(x), x)
+
+    def test_indices_follow_device_and_state_dict(self):
+        cond = PointWiseCondition(
+            torch.arange(N, dtype=torch.float32), torch.arange(N) % 2 == 0
+        )
+        fresh = PointWiseCondition(torch.zeros(N), torch.arange(N) % 2 == 0)
+        fresh.load_state_dict(cond.state_dict())
+        assert torch.equal(fresh.observed_target, cond.observed_target)
