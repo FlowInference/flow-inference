@@ -1,3 +1,54 @@
+"""Conditions: the likelihoods ``log p(condition | x)`` that guidance steers towards.
+
+A condition scores how well a field satisfies some requirement. It is an
+``nn.Module`` whose :meth:`~BaseCondition.logp` maps a batch of fields to one
+log-likelihood per sample. The field always arrives *flat*, with shape ``(B, C, N)``
+(batch, channels, points), in the data space of the flow; the result has shape
+``(B,)``. Guidance differentiates ``logp`` with respect to the field, so it should be
+smooth and finite wherever the sampler may visit.
+
+Building blocks:
+
+- :class:`BinaryCondition`: an inequality, such as ``x > 0`` or monotonicity.
+  Subclasses return a margin from :meth:`~BinaryCondition.smooth_eval_condition` that
+  is positive where the condition holds, and the likelihood is the smooth relaxation
+  ``logsigmoid(margin / v)``; a smaller softness ``v`` is closer to a hard
+  constraint.
+- :class:`EqualityCondition`: an equality, such as an observation or a differential
+  equation. Subclasses return a residual from :meth:`~EqualityCondition.residual` that
+  is zero where the condition holds, and the likelihood is Gaussian with tolerance
+  ``sigma``.
+- :class:`PointWiseCondition`: an :class:`EqualityCondition` for noisy observations of
+  the field at a subset of points.
+- :class:`ProductCondition`: several conditions imposed together (their log-likelihoods
+  add).
+
+To write a new condition, subclass :class:`BinaryCondition` or
+:class:`EqualityCondition` and implement the one method returning a ``(B, C, A)``
+tensor of ``A`` components, or subclass :class:`BaseCondition` and implement
+:meth:`~BaseCondition.logp` directly. A condition that works on an ``H x W`` lattice
+(a PDE residual, pooling over regions) can call :meth:`~BaseCondition.as_grid` to view
+the flat field as ``(B, C, H, W)``; the grid shape is taken from the flow when the
+condition is passed to a guidance object, and is stored as ``output_shape``.
+
+Conditions imposed at every grid cell
+-------------------------------------
+Both relaxations sum one term per component. That is right when the components are a
+fixed set of quantities (observations at given points, region totals, one peak). When
+the condition is imposed at *every grid cell* (an ODE or PDE residual, a pointwise
+bound, monotonicity), refining the grid adds terms, so the same ``sigma`` enforces the
+condition ever more tightly and the posterior changes with resolution. Passing
+``weights=`` the cell size (``dx``, or ``dx * dt`` on a space-time grid) turns the sum
+into a Riemann sum for an integral over the domain::
+
+    log p = -sum_a w_a r_a^2 / (2 sigma^2)  ~  -(1 / 2 sigma^2) * integral r(x)^2 dx
+
+so ``sigma`` becomes a tolerance on the root-mean-square residual over the domain and
+means the same thing at any resolution. For an inequality, write the margin so that it
+also has a continuum limit: a slope ``(f[j+1] - f[j]) / dx`` rather than a raw
+difference, which shrinks as the grid is refined.
+"""
+
 import math
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
@@ -7,33 +58,34 @@ import torch.nn as nn
 
 
 class BaseCondition(nn.Module, ABC):
-    """Abstract base class for conditions: the likelihood ``log p(condition | x)``.
+    """Abstract base class for conditions: a likelihood ``log p(condition | x)``.
 
-    Subclasses implement :meth:`logp`, mapping a field ``(B, C, N)`` to ``(B,)``.
+    Subclasses implement :meth:`logp`, mapping a flat field ``(B, C, N)`` to ``(B,)``.
+    Conditions that reason about the field on a lattice call :meth:`as_grid` to view
+    it as ``(B, C, *output_shape)``. Physical spacings such as ``dx`` and ``dt`` are
+    not inferred from the grid; pass them to the subclass constructor.
 
-    A condition always receives the *flat* data-space field ``(B, C, N)``. Conditions
-    that reason about a field on an ``H × W`` lattice (PDE residuals, pooling, ...)
-    call :meth:`as_grid` to view it as ``(B, C, *output_shape)``; ``output_shape`` is
-    set from the flow when the condition is handed to a guidance object or corrector
-    (see :meth:`bind_output_shape`). Physical spacings such as ``dx``/``dt`` stay
-    explicit constructor arguments.
+    Attributes:
+        output_shape: the flow's per-channel grid shape, e.g. ``(H, W)``, or None until
+            the condition is passed to a guidance object (see
+            :meth:`bind_output_shape`).
     """
 
     def __init__(self):
         super().__init__()
-        # Per-channel grid shape, auto-wired from the flow at guidance/sampler time.
-        # None until bound (or for conditions that don't care about the grid).
         self.output_shape: tuple[int, ...] | None = None
 
     def bind_output_shape(self, output_shape: tuple[int, ...] | None) -> None:
         """Record the flow's per-channel ``output_shape`` (e.g. ``(H, W)``).
 
-        Called by guidance objects so grid-aware conditions can
-        reshape the flat field via :meth:`as_grid` without being told the grid in
-        their constructor. An explicit shape already set on the condition is kept
-        (so a condition can override the flow's view if it really needs to);
-        otherwise the flow's shape is adopted. Propagates into any nested
-        sub-conditions (e.g. :class:`ProductCondition`).
+        Called by guidance objects, so that grid-aware conditions can use
+        :meth:`as_grid` without being given the grid in their constructor. A shape
+        already set on a condition is kept, which lets a condition override the flow's
+        view if it needs to. The shape is also passed to nested sub-conditions (e.g.
+        those of a :class:`ProductCondition`).
+
+        Args:
+            output_shape: the flow's per-channel grid shape, or None.
         """
         shape = tuple(output_shape) if output_shape is not None else None
         # modules() yields self and every nested sub-condition.
@@ -44,9 +96,17 @@ class BaseCondition(nn.Module, ABC):
     def as_grid(self, x: torch.Tensor) -> torch.Tensor:
         """View a flat field ``(B, C, N)`` as ``(B, C, *output_shape)``.
 
-        Requires :attr:`output_shape` to have been bound (it is auto-wired from the
-        flow). Validates that the flat width matches the grid so a mismatched flow /
-        condition pairing fails loudly rather than silently mis-tiling the field.
+        Args:
+            x: flat field ``(B, C, N)``.
+
+        Returns:
+            A view of ``x`` with shape ``(B, C, *output_shape)``.
+
+        Raises:
+            RuntimeError: if :attr:`output_shape` has not been set.
+            ValueError: if ``N`` does not match the number of grid cells, so that a
+                mismatched flow and condition fail loudly rather than mis-tiling the
+                field.
         """
         if self.output_shape is None:
             raise RuntimeError(
@@ -66,40 +126,41 @@ class BaseCondition(nn.Module, ABC):
 
     @abstractmethod
     def logp(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Compute logprob for input x .
+        """Log-likelihood of the condition given each field in the batch.
+
+        Args:
+            x: flat field ``(B, C, N)``.
 
         Returns:
-            logprob: Tensor of shape (B)
+            ``log p(condition | x)``, shape ``(B,)``.
         """
         raise NotImplementedError
 
     def standardised_residual(self, x: torch.Tensor) -> torch.Tensor:
-        """Residual view of the condition, ``(B, C, A)``.
+        """The condition as a vector of residuals in units of its tolerance.
 
-        The condition is satisfied when this is zero, and a value of 1 means "off by one
-        sigma". Concretely it is ``residual(x) / sigma``,
+        Optional: :meth:`logp` is all the library needs. :class:`EqualityCondition`
+        and :class:`BinaryCondition` define it; other subclasses may override it.
 
-        :meth:`logp` is enough for anything that differentiates or importance-weights,
-        but the ensemble methods
-        (:class:`~flow_inference.guidance.GuidanceEnsembleKalman`) need the *vector*
-        residual, not the scalar log-density: they build a Kalman gain from the
-        ensemble cross-covariance between the field and each residual component, which
-        is what lets them stand in for a Jacobian without ever differentiating one.
-        Collapsing to logp first would throw that structure away.
+        Args:
+            x: flat field ``(B, C, N)``.
+
+        Returns:
+            Residuals ``(B, C, A)``, zero where the condition is satisfied; a value of
+            1 means off by one tolerance.
         """
         raise NotImplementedError(
-            f"{type(self).__name__} does not define standardised_residual, which "
-            "ensemble (derivative-free) guidance needs. Either subclass "
-            "EqualityCondition / BinaryCondition, override standardised_residual to "
-            "return residual/sigma with shape (B, C, A), or use a logp-based guidance "
-            "(GuidanceDPS / GuidanceMC / GuidanceMCFisher)."
+            f"{type(self).__name__} does not define standardised_residual. Subclass "
+            "EqualityCondition / BinaryCondition, or override standardised_residual to "
+            "return residual/sigma with shape (B, C, A)."
         )
 
 
 class ProductCondition(BaseCondition):
-    """
-    Combines multiple conditions by summing their log-probs.
+    """Several conditions imposed together: their log-likelihoods are summed.
+
+    Args:
+        conditions: the conditions to combine.
     """
 
     def __init__(self, conditions: Sequence["BaseCondition"]):
@@ -107,122 +168,218 @@ class ProductCondition(BaseCondition):
         self.conditions = nn.ModuleList(conditions)
 
     def logp(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        x: (B, C, N)
-        returns: logprob (B)
-        """
+        """Sum of the sub-conditions' log-likelihoods.
 
+        Args:
+            x: flat field ``(B, C, N)``.
+
+        Returns:
+            Log-likelihood, shape ``(B,)``.
+        """
         return torch.stack([cond.logp(x) for cond in self.conditions]).sum(0)
 
     def standardised_residual(self, x: torch.Tensor) -> torch.Tensor:
-        """Concatenate the sub-conditions' standardised residuals along the component axis.
+        """The sub-conditions' standardised residuals, concatenated along the last axis.
 
-        Each block arrives already divided by its own sigma, which is what makes the
-        components commensurate: a PDE residual and a boundary value live on entirely
-        different scales, and a single shared sigma would let the loosest one dominate
-        the Kalman gain.
+        Each block is in units of its own tolerance, so blocks on very different
+        scales (a PDE residual and a boundary value, say) are directly comparable.
+
+        Args:
+            x: flat field ``(B, C, N)``.
+
+        Returns:
+            Residuals ``(B, C, A_1 + A_2 + ...)``.
         """
         return torch.cat(
             [cond.standardised_residual(x) for cond in self.conditions], dim=-1
         )
 
 
-class BinaryCondition(BaseCondition):
-    """Smooth relaxation of an inequality (a yes/no condition, e.g. ``x > 0``):
-    ``log p = sum logsigmoid(cond(x) / v)``."""
+def _as_weights(weights) -> torch.Tensor | None:
+    """``weights`` as a tensor (or None), checked finite and non-negative."""
+    if weights is None:
+        return None
+    w = torch.as_tensor(weights, dtype=torch.get_default_dtype())
+    if not torch.isfinite(w).all() or (w < 0).any():
+        raise ValueError("weights must be finite and non-negative")
+    return w
 
-    def __init__(self, v: float = 1e-4):
+
+def _sum_terms(terms: torch.Tensor, weights: torch.Tensor | None) -> torch.Tensor:
+    """Sum per-component terms ``(B, C, A)`` to ``(B,)``, each times its weight."""
+    if weights is not None:
+        terms = terms * weights.to(terms)
+    return terms.sum(dim=[1, 2])
+
+
+class BinaryCondition(BaseCondition):
+    """Smooth relaxation of an inequality (a yes/no condition such as ``x > 0``).
+
+    Subclasses implement :meth:`smooth_eval_condition`, returning a margin
+    ``cond_a(x)`` per component that is positive where the condition holds. The
+    log-likelihood is ``sum_a w_a logsigmoid(cond_a(x) / v)``: close to 0 where the
+    margin is comfortably positive and falling linearly where it is negative.
+
+    Args:
+        v: softness of the relaxation; smaller is closer to a hard constraint.
+        weights: optional quadrature weights ``w_a``, a scalar (the cell size) or a
+            tensor broadcastable to ``(C, A)``. Leave as None (every ``w_a = 1``) for a
+            fixed set of margins; set it to the cell size for a constraint imposed at
+            every grid cell (see the module docstring).
+    """
+
+    def __init__(self, v: float = 1e-4, weights=None):
         super().__init__()
         self.register_buffer("v", torch.tensor(float(v)))
+        # Not named `weights`, which subclasses often use for something else.
+        self.register_buffer("quadrature_weights", _as_weights(weights))
 
     def logp(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        x: (B, C, N)
-        returns logprob: (B)
-        """
+        """Log-likelihood ``sum_a w_a logsigmoid(cond_a(x) / v)``.
 
+        Args:
+            x: flat field ``(B, C, N)``.
+
+        Returns:
+            Log-likelihood, shape ``(B,)``.
+        """
         cond = self.smooth_eval_condition(x)
         logp = torch.nn.functional.logsigmoid(cond / self.v)
-        return logp.sum(dim=[1, 2])  # (B,)
+        return _sum_terms(logp, self.quadrature_weights)
 
     def standardised_residual(self, x: torch.Tensor) -> torch.Tensor:
-        """Smooth hinge on the constraint margin, in units of ``v``: ``softplus(-cond / v)``.
+        """The violation of each margin in units of ``v``: ``softplus(-cond / v)``.
 
-        An inequality has no target to regress onto, so the residual is the *violation*:
-        it decays to zero once ``cond`` is comfortably positive (satisfied) and grows
-        like ``-cond / v`` when it is negative. The tail shape differs from
-        :meth:`logp`'s logsigmoid — quadratic rather than linear far into the violated
-        region — but both are minimised on exactly the same set, and the ensemble update
-        only uses the residual to decide a direction and a gain.
+        Zero once ``cond`` is comfortably positive and growing like ``-cond / v`` where
+        it is negative. Scaled by ``sqrt(w_a)`` when weights are set.
+
+        Args:
+            x: flat field ``(B, C, N)``.
+
+        Returns:
+            Residuals ``(B, C, A)``.
         """
-        return torch.nn.functional.softplus(-self.smooth_eval_condition(x) / self.v)
+        r = torch.nn.functional.softplus(-self.smooth_eval_condition(x) / self.v)
+        w = self.quadrature_weights
+        return r if w is None else r * w.to(r).sqrt()
 
     @abstractmethod
     def smooth_eval_condition(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        x: (B, C, N)
-        returns logprob: (B, C, A)
+        """Evaluate the margin of each component of the inequality.
 
-        Evaluates the binary condition on input x. Should return a cts tensor of shape (B, C, A) where
-        values > 0 indicate condition is satisfied and values < 0 indicate condition
-        is not satisfied. Conditions have A components (e.g. monotonicity has A=H-1 components corresponding to each pair of adjacent pixels).
+        The condition has ``A`` components; monotonicity on ``H`` points, for example,
+        has ``A = H - 1``, one per pair of neighbours. The margin should be continuous
+        in ``x``.
+
+        Args:
+            x: flat field ``(B, C, N)``.
+
+        Returns:
+            Margins ``(B, C, A)``: positive where the component is satisfied, negative
+            where it is violated.
         """
         raise NotImplementedError
 
 
 class EqualityCondition(BaseCondition):
-    """
-    Gaussian-likelihood relaxation of an equality constraint: log p(condition | x) = -‖residual(x)‖² / (2σ²).
+    """Gaussian relaxation of an equality constraint ``residual(x) = 0``.
+
+    Subclasses implement :meth:`residual`. The log-likelihood is
+    ``-sum_a w_a residual_a(x)^2 / (2 sigma^2)``.
+
+    Args:
+        sigma: tolerance on the residual (the observation noise standard deviation,
+            for data).
+        weights: optional quadrature weights ``w_a``, a scalar (the cell size) or a
+            tensor broadcastable to ``(C, A)``. Leave as None (every ``w_a = 1``) when
+            the residual has a fixed set of components; set it to the cell size when
+            the residual is evaluated at every grid cell, so that ``sigma`` is a
+            resolution-independent tolerance on the integrated residual (see the
+            module docstring).
     """
 
-    def __init__(self, sigma: float = 1e-4):
+    def __init__(self, sigma: float = 1e-4, weights=None):
         super().__init__()
         self.register_buffer("sigma", torch.tensor(float(sigma)))
+        # Not named `weights`, which subclasses often use for something else.
+        self.register_buffer("quadrature_weights", _as_weights(weights))
 
     def logp(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        x: (B, C, N)
-        returns logprob: (B)
-        """
+        """Log-likelihood ``-sum_a w_a residual_a(x)^2 / (2 sigma^2)``.
 
-        diff = self.residual(x)  # [B, C, A]
+        Args:
+            x: flat field ``(B, C, N)``.
+
+        Returns:
+            Log-likelihood, shape ``(B,)``.
+        """
+        diff = self.residual(x)
         logp = -0.5 * (diff / self.sigma) ** 2
-        return logp.sum(dim=[1, 2])  # (B,)
+        return _sum_terms(logp, self.quadrature_weights)
 
     def standardised_residual(self, x: torch.Tensor) -> torch.Tensor:
-        """The equality residual, expressed in units of its own sigma."""
-        return self.residual(x) / self.sigma
+        """The residual in units of ``sigma``, scaled by ``sqrt(w_a)`` when weights
+        are set, so that ``logp == -0.5 * ||standardised_residual||^2``.
+
+        Args:
+            x: flat field ``(B, C, N)``.
+
+        Returns:
+            Residuals ``(B, C, A)``.
+        """
+        r = self.residual(x) / self.sigma
+        w = self.quadrature_weights
+        return r if w is None else r * w.to(r).sqrt()
 
     @abstractmethod
     def residual(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        x: (B, C, N)
-        returns residual: (B, C, A)
+        """Evaluate the residual of each component of the equality.
 
-        Evaluates the residual of the condition on x. Should return a cts tensor of shape (B, C, A)
-        for conditions with A components.
+        Args:
+            x: flat field ``(B, C, N)``.
+
+        Returns:
+            Residuals ``(B, C, A)``, zero where the condition holds.
         """
         raise NotImplementedError
 
 
 class PointWiseCondition(EqualityCondition):
-    """
-    Point-wise conditioning. Give whole field x, but only care about specific points, specified by mask.
+    """Noisy observations of a single-channel field at a subset of its points.
+
+    The residual is ``x[mask] - target_field[mask]``; entries of ``target_field``
+    outside the mask are ignored.
+
+    Args:
+        target_field: observed values, shape ``(N,)``.
+        mask: boolean mask ``(N,)`` selecting the observed points.
+        sigma: observation noise standard deviation.
+        weights: optional quadrature weights (see :class:`EqualityCondition`).
     """
 
     def __init__(
-        self, target_field: torch.Tensor, mask: torch.Tensor, sigma: float = 0.1
+        self,
+        target_field: torch.Tensor,
+        mask: torch.Tensor,
+        sigma: float = 0.1,
+        weights=None,
     ):
-        super().__init__(sigma=sigma)
-        self.register_buffer("mask", mask)  # (N)
-        self.register_buffer("target_field", target_field)  # (N)
+        super().__init__(sigma=sigma, weights=weights)
+        self.register_buffer("mask", mask)
+        self.register_buffer("target_field", target_field)
 
     def residual(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        x: (B, C, N) where C=1
-        returns residual: (B, C, A) where A is the number of masked points
+        """Difference between the field and the target at the observed points.
 
-        Single-channel only: the mask indexes the field axis.
+        Args:
+            x: flat field ``(B, 1, N)``.
+
+        Returns:
+            Residuals ``(B, 1, A)``, where ``A`` is the number of observed points.
+
+        Raises:
+            ValueError: if ``x`` has more than one channel or its width does not match
+                the mask.
         """
         if x.shape[1] != 1:
             raise ValueError(
@@ -235,7 +392,5 @@ class PointWiseCondition(EqualityCondition):
                 f"field width N={x.shape[-1]} does not match mask length "
                 f"{self.mask.shape[0]}"
             )
-        x_2d = x.squeeze(1)  # (B, N)
-        # Extract only masked pixels
-        diff = x_2d[:, self.mask] - self.target_field[None, self.mask]  # (B, A)
-        return diff.unsqueeze(1)  # (B, C=1, A)
+        diff = x.squeeze(1)[:, self.mask] - self.target_field[None, self.mask]
+        return diff.unsqueeze(1)

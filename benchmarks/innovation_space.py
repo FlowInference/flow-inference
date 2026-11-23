@@ -1,17 +1,22 @@
 """Benchmark guided-flow sampling against innovation-space baselines.
 
-Compares LatentFlow (``IntegratorSampler`` + ``GuidanceMC``) with preconditioned
-Crank–Nicolson, elliptical slice sampling, Hamiltonian Monte Carlo and likelihood-
-tempered SMC (with pCN or elliptical-slice moves), all on the same latent target.
-Every method gets the same number of likelihood evaluations per draw as LatentFlow
-spends (999 with the default 1,000 steps and one Monte Carlo sample per step).
-``compare`` works for any flow with an N(0, I) innovation prior and any condition. The
-script's default problem is a 1D GP observed with Gaussian noise, whose exact posterior
-and evidence are known, so each method's error is reported too.
+Compares LatentFlow (``IntegratorSampler`` with ``GuidanceMC``) with classical
+methods on the same latent target: preconditioned Crank–Nicolson and its gradient
+version pCN-MALA, elliptical slice sampling, Hamiltonian Monte Carlo, NUTS,
+likelihood-tempered SMC (with pCN or elliptical-slice moves), and expectation
+propagation. The MCMC and SMC methods get the same number of likelihood evaluations
+per draw as LatentFlow spends (999 with the default 1,000 steps and one Monte Carlo
+sample per step); EP sets its own cost.
+
+:func:`compare` works for any flow with an ``N(0, I)`` innovation prior and any
+condition. The script's default problem is a 1D GP observed with Gaussian noise,
+whose exact posterior and evidence are known, so each method's error is reported
+too.
 
 Run from the repository root:
 
-    python scripts/benchmark_innovation_space.py --num-samples 500
+    python -m benchmarks.innovation_space --num-samples 500
+    python -m benchmarks.innovation_space --methods NUTS EP   # a subset
 """
 
 import argparse
@@ -22,21 +27,35 @@ import time
 import gpytorch
 import torch
 
+from benchmarks.ep import ep
+from benchmarks.mcmc import (
+    elliptical_slice,
+    hmc,
+    nuts,
+    pcn,
+    pcn_mala,
+    tempered_smc,
+)
 from flow_inference.conditions import PointWiseCondition
+from flow_inference.flow_utils import float64_copy
 from flow_inference.flows import GaussianProcessFlow
 from flow_inference.guidance import GuidanceMC
-from flow_inference.mcmc import elliptical_slice, hmc, pcn, tempered_smc
 from flow_inference.sampler import IntegratorSampler
 
 
 def _sync(device):
+    """Wait for queued CUDA work, so wall-clock timings are accurate."""
     if str(device).startswith("cuda"):
         torch.cuda.synchronize()
 
 
 @contextlib.contextmanager
 def counting_evaluations(condition):
-    """Count the draws ``condition.logp`` scores inside the block, in ``counter["evals"]``."""
+    """Count the draws ``condition.logp`` scores inside the block.
+
+    Yields:
+        A dict whose ``"evals"`` entry holds the running count.
+    """
     counter = {"evals": 0}
     original = condition.logp
 
@@ -44,7 +63,7 @@ def counting_evaluations(condition):
         counter["evals"] += x.shape[0]
         return original(x)
 
-    condition.logp = logp  # an instance attribute shadows the method
+    condition.logp = logp  # an instance attribute shadows the class's method
     try:
         yield counter
     finally:
@@ -52,7 +71,12 @@ def counting_evaluations(condition):
 
 
 def run_latentflow(flow, condition, num_samples, num_steps, num_mc_samples):
-    """Independent guided samples ``(num_samples, C, *output_shape)``, with their cost."""
+    """Draw independent guided samples ``(num_samples, C, *output_shape)``.
+
+    Returns:
+        A run dict with the ``samples``, wall-clock ``seconds`` and likelihood
+        ``evals`` spent.
+    """
     guidance = GuidanceMC(flow, condition, num_mc_samples=num_mc_samples)
     guidance = guidance.to(flow.device)
     sampler = IntegratorSampler(flow)
@@ -86,11 +110,15 @@ def _draws(samples, num_samples, discard=0.0):
 def run_mcmc(
     sampler, flow, condition, num_samples, num_chains, num_iters, burn_in, **kwargs
 ):
-    """``num_samples`` draws pooled from ``num_chains`` chains of ``num_iters`` iterations.
+    """Pool ``num_samples`` draws from ``num_chains`` chains of ``num_iters`` steps.
 
     The first ``burn_in`` iterations of each chain are discarded and the rest thinned
-    evenly. ``sampler`` may stop early on a ``max_likelihood_evals`` budget (elliptical
-    slice), in which case pass ``burn_in=0`` and ``discard`` the burn-in afterwards.
+    evenly. A sampler that may stop early on a ``max_likelihood_evals`` budget
+    (elliptical slice) should get ``burn_in=0`` and a ``discard`` fraction, which
+    drops the burn-in afterwards.
+
+    Returns:
+        A run dict with the ``samples``, ``seconds``, ``evals`` and sampler ``stats``.
     """
     discard = kwargs.pop("discard", 0.0)
     per_chain = math.ceil(num_samples / num_chains)
@@ -115,6 +143,7 @@ def run_mcmc(
 
 
 def run_smc(flow, condition, num_samples, kernel, num_moves, budget):
+    """Tempered SMC with ``num_samples`` particles on a ``budget`` of evaluations."""
     _sync(flow.device)
     result = tempered_smc(
         flow,
@@ -134,6 +163,49 @@ def run_smc(flow, condition, num_samples, kernel, num_moves, budget):
     }
 
 
+def run_nuts(flow, condition, num_samples, num_chains, budget, burn_in):
+    """NUTS on a budget of likelihood evaluations.
+
+    Each chain runs ``burn_in`` adaptation iterations, then iterations until its share
+    of ``budget`` is spent; the draws are pooled and thinned evenly.
+    """
+    _sync(flow.device)
+    result = nuts(
+        flow,
+        condition,
+        num_chains=num_chains,
+        num_iters=budget,  # an upper bound: every iteration costs at least one
+        burn_in=burn_in,
+        max_likelihood_evals=budget,
+    )
+    _sync(flow.device)
+    return {
+        "samples": _draws(result.samples, num_samples),
+        "seconds": result.wall_time,
+        "evals": result.num_likelihood_evals,
+        "stats": result.stats,
+    }
+
+
+def run_ep(flow, condition, num_samples):
+    """EP, or a ``"skipped"`` entry when the condition's sites are not affine.
+
+    EP's cost is counted in 1D site evaluations, so it is not on the same budget as
+    the samplers and is reported with zero likelihood evaluations.
+    """
+    try:
+        result = ep(flow, condition, num_samples)
+    except (TypeError, ValueError) as error:
+        return {"skipped": str(error)}
+    return {
+        "samples": result.samples,
+        "seconds": result.wall_time,
+        "evals": 0,  # deterministic; see EPResult.num_likelihood_evals
+        "log_evidence": result.log_evidence,
+        "stats": {"sweeps": result.num_sweeps, **result.stats},
+    }
+
+
 def compare(
     flow,
     condition,
@@ -144,27 +216,54 @@ def compare(
     num_leapfrog=10,
     smc_moves=20,
     smc_ess_moves=3,
+    nuts_burn_in=200,
     reference=None,
+    methods=None,
 ):
-    """Run every method on LatentFlow's budget; returns ``{method: run}``.
+    """Run every method on LatentFlow's budget and print a comparison table.
 
     LatentFlow runs first, and the ``condition.logp`` evaluations it spends in total
-    become every other method's budget. MCMC splits it across ``num_chains`` long chains
-    and pools ``num_samples`` thinned draws from their second halves (one fresh chain
-    per draw would pay a burn-in for every draw):
+    become every other method's budget. MCMC splits it across ``num_chains`` long
+    chains and pools ``num_samples`` thinned draws from their second halves (one fresh
+    chain per draw would pay a burn-in for every draw):
 
-    * pCN: one evaluation per iteration, the first half burn-in (``rho`` adapts there);
+    * pCN: one evaluation per iteration, the first half burn-in (``rho`` adapts
+      there);
+    * pCN-MALA: one evaluation (with gradient) per iteration, likewise;
     * HMC: ``num_leapfrog`` evaluations per iteration, likewise;
+    * NUTS: ``nuts_burn_in`` adaptation iterations per chain, then iterations until
+      the budget is spent (trajectory lengths vary). Chains run one after another, so
+      its wall time is not comparable, but its evaluations are;
     * elliptical slice: iterations until the budget is spent (their cost varies);
-    * tempered SMC: ``smc_moves`` pCN moves (or ``smc_ess_moves`` elliptical-slice moves,
-      which cost several evaluations each) per stage up to ``beta = 1``, then further
-      moves at ``beta = 1`` until the budget is spent. Tempering always finishes, so
-      too many moves per stage overrun the budget; the table shows evaluations spent.
+    * tempered SMC: ``smc_moves`` pCN moves (or ``smc_ess_moves`` elliptical-slice
+      moves, which cost several evaluations each) per stage up to ``beta = 1``, then
+      further moves at ``beta = 1`` until the budget is spent. Tempering always
+      finishes, so too many moves per stage overrun the budget; the table shows the
+      evaluations actually spent;
+    * EP: sets its own cost. It is a Gaussian approximation rather than a sampler,
+      and applies only to conditions with affine sites (it is skipped otherwise).
 
-    All methods return ``num_samples`` draws; SMC uses ``num_samples`` particles.
-    ``reference`` is an optional ``(mean, std, log_evidence)`` of the exact posterior in
-    data space (``log_evidence`` may be None); when given, each method's mean absolute
-    error in the mean and standard deviation, and SMC's evidence error, are printed.
+    Every method returns ``num_samples`` draws; SMC uses ``num_samples`` particles.
+
+    Args:
+        flow: a flow with an ``N(0, I)`` innovation prior.
+        condition: the condition to sample under.
+        num_samples: draws per method.
+        num_steps, num_mc_samples: LatentFlow's integration steps and Monte Carlo
+            samples per step, which together set the budget.
+        num_chains: chains per MCMC method.
+        num_leapfrog: HMC leapfrog steps per iteration.
+        smc_moves, smc_ess_moves: SMC moves per stage with the pCN and
+            elliptical-slice kernels.
+        nuts_burn_in: NUTS adaptation iterations per chain.
+        reference: optional ``(mean, std, log_evidence)`` of the exact posterior in
+            data space (``log_evidence`` may be None). When given, the table also
+            shows each method's mean absolute error in the mean and standard
+            deviation, and the evidence error of the methods that estimate it.
+        methods: a subset of :data:`METHODS` to run; all by default.
+
+    Returns:
+        The runs, ``{method: run}``.
     """
     runs, per_draw, per_chain = run_all(
         flow,
@@ -176,6 +275,8 @@ def compare(
         num_leapfrog,
         smc_moves,
         smc_ess_moves,
+        methods=METHODS if methods is None else methods,
+        nuts_burn_in=nuts_burn_in,
     )
     print(
         f"budget: {per_draw} likelihood evaluations per draw, {num_samples} draws; "
@@ -188,10 +289,13 @@ def compare(
 METHODS = (
     "LatentFlow",
     "pCN",
+    "pCN-MALA",
     "elliptical slice",
     "HMC",
+    "NUTS",
     "SMC (pCN moves)",
     "SMC (ESS moves)",
+    "EP",
 )
 
 
@@ -206,6 +310,7 @@ def run_all(
     smc_moves,
     smc_ess_moves,
     methods=METHODS,
+    nuts_burn_in=200,
 ):
     """Run ``methods`` on LatentFlow's budget (see :func:`compare`), without printing.
 
@@ -225,6 +330,11 @@ def run_all(
     mcmc = (flow, condition, num_samples, num_chains)
     runners = {
         "pCN": lambda: run_mcmc(pcn, *mcmc, pcn_iters, pcn_iters // 2),
+        "pCN-MALA": lambda: run_mcmc(pcn_mala, *mcmc, pcn_iters, pcn_iters // 2),
+        "NUTS": lambda: run_nuts(
+            flow, condition, num_samples, num_chains, budget, nuts_burn_in
+        ),
+        "EP": lambda: run_ep(flow, condition, num_samples),
         "elliptical slice": lambda: run_mcmc(
             elliptical_slice,
             *mcmc,
@@ -256,6 +366,9 @@ def print_table(runs, num_samples, reference=None):
         header += f" {'|mean err|':>11s} {'|std err|':>10s} {'|logZ err|':>11s}"
     print(header)
     for name, run in runs.items():
+        if "skipped" in run:
+            print(f"{name:18s} skipped: {run['skipped']}")
+            continue
         line = f"{name:18s} {run['seconds']:8.2f} {run['evals'] / num_samples:11.1f}"
         if reference is not None:
             mean, std, log_evidence = reference
@@ -282,20 +395,37 @@ def conjugate_gp_problem(
 ):
     """A 1D GP observed at ``num_obs`` points with Gaussian noise.
 
-    Returns ``(flow, condition, (mean, std, log_evidence))``, the last being the exact
-    posterior moments in data space and the log evidence of ``condition.logp``. With
-    ``return_cov``, the exact posterior covariance follows as a fourth element.
+    The prior is a Matérn-5/2 GP on ``num_points`` grid points in ``[0, 1]``; the
+    observations are a prior draw plus noise, at random grid points.
+
+    Args:
+        num_points: grid size.
+        num_obs: number of observed grid points.
+        noise: observation noise standard deviation.
+        lengthscale: the kernel's lengthscale.
+        device: where to build the flow and condition.
+        seed: seed for the observation locations and values.
+        return_cov: also return the exact posterior covariance.
+
+    Returns:
+        ``(flow, condition, (mean, std, log_evidence))``, the last being the exact
+        posterior moments in data space and the log evidence of ``condition.logp``;
+        with ``return_cov``, the exact posterior covariance follows as a fourth
+        element.
     """
     generator = torch.Generator().manual_seed(seed)
-    grid = torch.linspace(0, 1, num_points, dtype=torch.float64, device=device)
+    grid = torch.linspace(0, 1, num_points, device=device)
     kernel = gpytorch.kernels.ScaleKernel(gpytorch.kernels.MaternKernel(nu=2.5))
-    kernel = kernel.double().to(device)
+    kernel = kernel.to(device)
     kernel.base_kernel.lengthscale = lengthscale
     flow = GaussianProcessFlow(
         kernel, gpytorch.means.ZeroMean(), grid.unsqueeze(-1), device=device
     )
 
-    K = (flow.L[0] @ flow.L[0].T).cpu()
+    # The exact reference is kernel-matrix work, so it runs in float64 even though
+    # the samplers use the flow's float32.
+    g64 = grid.unsqueeze(-1).double()
+    K = float64_copy(kernel)(g64, g64).to_dense().detach().cpu()
     eye = torch.eye(num_points, dtype=K.dtype)
     mask = torch.zeros(num_points, dtype=torch.bool)
     mask[torch.randperm(num_points, generator=generator)[:num_obs]] = True
@@ -303,7 +433,9 @@ def conjugate_gp_problem(
     truth = torch.linalg.cholesky(K + 1e-8 * eye) @ z
     noise_draw = torch.randn(num_points, generator=generator, dtype=K.dtype)
     target = truth + noise * noise_draw
-    condition = PointWiseCondition(target.to(device), mask.to(device), sigma=noise)
+    condition = PointWiseCondition(
+        target.to(device, flow.dtype), mask.to(device), sigma=noise
+    )
 
     K_obs = K[mask][:, mask] + noise**2 * torch.eye(num_obs, dtype=K.dtype)
     gain = K[:, mask] @ torch.linalg.inv(K_obs)
@@ -326,7 +458,6 @@ def conjugate_gp_problem(
 
 
 if __name__ == "__main__":
-    torch.set_default_dtype(torch.float64)
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--num-samples", type=int, default=500, help="draws per method")
     parser.add_argument("--num-steps", type=int, default=1_000, help="LatentFlow steps")
@@ -346,6 +477,15 @@ if __name__ == "__main__":
         "--smc-ess-moves", type=int, default=3, help="SMC ESS moves per stage"
     )
     parser.add_argument(
+        "--nuts-burn-in", type=int, default=200, help="NUTS adaptation iterations"
+    )
+    parser.add_argument(
+        "--methods",
+        nargs="+",
+        default=list(METHODS),
+        help="methods to run (LatentFlow always runs: it sets the budget)",
+    )
+    parser.add_argument(
         "--device", default="cuda" if torch.cuda.is_available() else "cpu"
     )
     args = parser.parse_args()
@@ -362,5 +502,7 @@ if __name__ == "__main__":
         args.num_leapfrog,
         args.smc_moves,
         args.smc_ess_moves,
+        nuts_burn_in=args.nuts_burn_in,
         reference=reference,
+        methods=args.methods,
     )

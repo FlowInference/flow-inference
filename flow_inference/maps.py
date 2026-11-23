@@ -1,3 +1,20 @@
+"""Maps: deterministic, differentiable transforms of iid Gaussians into processes.
+
+A map turns a vector of iid ``N(0, 1)`` latents into a sample of a (typically
+non-Gaussian) random field, so that
+:class:`~flow_inference.flows.GaussianIncrementFlow` can sample and guide the process
+by diffusing over the latents. The maps here produce fields on an ``H x W`` grid in
+the unit box, with spatial dependence from a gpytorch kernel:
+
+* :class:`CauchyConvolutionMap`: a Cauchy convolution field with Gaussian marginals.
+* :class:`BrownResnickMap`: a Brown-Resnick max-stable field with Gaussian marginals.
+* :class:`StudentTProcessMap`: a Student-t process.
+* :class:`LogGaussianCoxMap`: the intensity surface of a log-Gaussian Cox process.
+* :class:`LevyNIGMap`: a Normal-Inverse-Gaussian field.
+
+Subclass :class:`BaseMap` for a new process.
+"""
+
 import math
 from abc import ABC, abstractmethod
 
@@ -5,54 +22,62 @@ import gpytorch
 import torch
 import torch.nn as nn
 
-from flow_inference.flow_utils import build_grid_in_box
+from flow_inference.flow_utils import build_grid_in_box, float64_copy
 
 _STD_NORMAL = torch.distributions.Normal(0.0, 1.0)
 _EPS = 1e-12
 
 
 def _unit_clamp(u: torch.Tensor, eps: float = _EPS) -> torch.Tensor:
-    """Clamp probabilities into (eps, 1 - eps) so CDF round-trips stay finite."""
+    """Clamp probabilities into ``(eps, 1 - eps)`` so inverse CDFs stay finite."""
     return u.clamp(min=eps, max=1.0 - eps)
 
 
 @torch.no_grad()
 def _gp_cholesky(H, W, kernel: gpytorch.kernels.Kernel, jitter, device):
-    """Kernel Gram matrix on the H*W grid and its lower Cholesky factor.
+    """Kernel matrix on the ``H x W`` grid and its lower Cholesky factor.
 
-    Returns ``(K, L)`` with ``K + jitter*I = L @ L^T``. The grid is built at the
-    kernel's dtype: the kernel is the user's object and its precision is the one
-    that matters, so following it keeps every buffer on a map coherent.
+    Returns ``(K, L)``, where ``K`` is the kernel matrix with ``jitter`` added to its
+    diagonal and ``K = L L^T``, both ``(H W, H W)`` in the kernel's dtype. They are
+    computed in float64 and then cast, since a float32 Cholesky of a GP kernel matrix
+    fails at the default jitter.
     """
-    coords = build_grid_in_box(H, W, device=device, dtype=kernel.dtype)  # (HW, d)
-    K = kernel(coords, coords).evaluate()  # (HW, HW)
+    coords = build_grid_in_box(H, W, device=device, dtype=torch.float64)  # (HW, d)
+    K = float64_copy(kernel)(coords, coords).to_dense()  # (HW, HW)
     K = K + jitter * torch.eye(H * W, device=device, dtype=K.dtype)
     L = torch.linalg.cholesky(K).contiguous()
-    return K, L
+    return K.to(kernel.dtype), L.to(kernel.dtype)
 
 
 def _k_diag_sqrt(K: torch.Tensor) -> torch.Tensor:
-    """Pointwise GP std sqrt(diag(K)) — divide a GP draw by this for unit marginals."""
+    """Pointwise GP standard deviation ``sqrt(diag(K))``.
+
+    Dividing a GP draw by it gives unit-variance marginals.
+    """
     return K.diagonal().sqrt().clamp(min=_EPS)
 
 
 class BaseMap(nn.Module, ABC):
-    """A deterministic, differentiable map from a latent space (iid isotropic
-    Gaussian increments) to a data space (a complicated field, path, or vector).
+    """Abstract base class for a map from iid Gaussians to a process.
 
-    A map is described by three numbers:
+    A map is a deterministic, differentiable function from iid ``N(0, 1)`` latents
+    ("increments") to a sample of a field, path or vector. Its dimensions are:
 
-      - ``latent_dim``    : iid N(0,1) map inputs per channel.
-      - ``output_shape``  : per-channel shape of a sample — ``(H, W)`` for a
-                            field on a lattice, ``(num_times,)`` for a path.
-      - ``channels``      : how many fields are stacked on the channel axis.
+    - ``latent_dim``: latents per channel.
+    - ``output_shape``: per-channel shape of a sample, e.g. ``(H, W)`` for a field on
+      a grid or ``(num_times,)`` for a path. ``output_dim`` is its product.
+    - ``channels``: how many fields are stacked on the channel axis.
 
-    Subclasses implement :meth:`_map`, which receives the full
-    ``(B, C, latent_dim)`` tensor and returns ``(B, C, output_dim)``.
-    A 2D ``(B, latent_dim)`` input is accepted as a single channel.
+    Subclasses implement :meth:`_map`, from ``(B, C, latent_dim)`` to
+    ``(B, C, output_dim)``. Register precomputed tensors with ``register_buffer`` so
+    they follow ``.to()`` and ``.double()``.
 
-    Precomputed tensors should be registered with ``register_buffer`` so they move
-    with ``.to(device)`` / ``.double()`` like the rest of the package.
+    Args:
+        latent_dim: latents per channel.
+        output_shape: per-channel shape of a sample.
+        channels: number of channels.
+        device: device of the map's tensors.
+        dtype: working precision of the map.
     """
 
     def __init__(
@@ -61,7 +86,7 @@ class BaseMap(nn.Module, ABC):
         output_shape: tuple[int, ...],
         channels: int = 1,
         device="cpu",
-        dtype=torch.float64,
+        dtype=torch.float32,
     ):
         super().__init__()
         self.latent_dim = latent_dim
@@ -69,8 +94,7 @@ class BaseMap(nn.Module, ABC):
         self.output_dim = math.prod(self.output_shape)
         self.channels = channels
         self.normal = _STD_NORMAL
-        # Empty buffer carrying only a device and dtype, so :attr:`device`/:attr:`dtype`
-        # follow ``.to()``/``.double()``. Non-persistent: not in the state_dict.
+        # device/dtype are read off an empty buffer so they follow .to()/.double().
         self.register_buffer(
             "_probe", torch.zeros(0, dtype=dtype, device=device), persistent=False
         )
@@ -86,27 +110,36 @@ class BaseMap(nn.Module, ABC):
         return self._probe.dtype
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
-        """Map latent Gaussian increments to a ``(B, C, output_dim)`` data field.
+        """Map latents to a ``(B, C, output_dim)`` sample.
 
         Accepts ``(B, C, latent_dim)`` or, for a single channel, ``(B, latent_dim)``.
         """
-        if z.dim() == 2:  # (B, latent_dim) -> (B, 1, latent_dim)
+        if z.dim() == 2:
             z = z.unsqueeze(1)
-        return self._map(z)  # (B, C, output_dim)
+        return self._map(z)
 
     @abstractmethod
     def _map(self, z: torch.Tensor) -> torch.Tensor:
-        """Map: ``(B, C, latent_dim)`` iid N(0,1) -> ``(B, C, output_dim)``."""
+        """Map ``(B, C, latent_dim)`` iid ``N(0, 1)`` latents to
+        ``(B, C, output_dim)``."""
         raise NotImplementedError
 
 
 class CauchyConvolutionMap(BaseMap):
-    """Map iid Gaussian samples to a Cauchy-convolution field with Gaussian marginals.
+    """Cauchy convolution field on an ``H x W`` grid, with standard normal marginals.
 
-    Cauchy variables are placed on a finer grid (``grid_fidelity_ratio`` per axis,
-    pushed slightly outside the unit box to capture the heavy Cauchy tails) and
-    convolved against the kernel; the convolved field is then pushed back to a
-    standard-Gaussian marginal via the probability-integral transform.
+    Each latent is turned into a Cauchy variable at a centre on a finer grid, and the
+    field is their convolution with the kernel. A weighted sum of Cauchy variables is
+    Cauchy, so the probability integral transform then gives exactly standard normal
+    marginals; the (non-Gaussian) dependence comes from the convolution.
+
+    Args:
+        H: grid height.
+        W: grid width.
+        kernel: the convolution kernel. Sets the map's dtype.
+        grid_fidelity_ratio: refinement of the grid of Cauchy centres per axis; finer
+            centres give a better approximation of the continuous convolution.
+        device: device of the map's tensors.
     """
 
     def __init__(
@@ -123,9 +156,7 @@ class CauchyConvolutionMap(BaseMap):
         num_latents = H * W * grid_fidelity_ratio**2
         super().__init__(num_latents, (H, W), device=device, dtype=kernel.dtype)
         self.H, self.W = H, W
-        self.grid_fidelity_ratio = (
-            grid_fidelity_ratio  # finer Cauchy centres => better convolution approx
-        )
+        self.grid_fidelity_ratio = grid_fidelity_ratio
 
         with torch.no_grad():
             coords = build_grid_in_box(H, W, device=device, dtype=kernel.dtype)
@@ -135,39 +166,48 @@ class CauchyConvolutionMap(BaseMap):
                 device=device,
                 dtype=kernel.dtype,
             )  # (M, 2)
-            # push the fine grid a bit outside the unit box: the Cauchy kernel has heavy
-            # tails, so centres beyond the support give a better convolution approximation
+            # Spread the centres beyond the unit box: the Cauchy variables are
+            # heavy-tailed, so centres outside the grid still contribute.
             fine_coords = (fine_coords - 0.1 / 3.0) * 3.0
-            big_K = kernel(coords, fine_coords).evaluate()  # (HW, M)
+            big_K = kernel(coords, fine_coords).to_dense()  # (HW, M)
             self.register_buffer("K_T", big_K.t().contiguous())  # (M, HW)
             self.register_buffer("inv_norm", 1.0 / big_K.sum(-1))  # (HW,)
 
     def _map(self, z: torch.Tensor) -> torch.Tensor:
-        """(B, C, HW*ratio^2) Gaussians -> (B, C, HW) Cauchy-convolution field."""
-        # inverse probability transform: Gaussian -> Uniform(0,1) -> Cauchy(0, gamma)
+        """``(B, C, H W ratio^2)`` latents to a ``(B, C, H W)`` field."""
+        # Gaussian -> Uniform(0, 1) -> standard Cauchy.
         u = self.normal.cdf(z)
         w = torch.tan(math.pi * (u - 0.5))
         S = w @ self.K_T
-        # map the convolved field to a uniform marginal, then to a Gaussian marginal
+        # S is Cauchy with scale 1 / inv_norm: its CDF gives a uniform, then a normal.
         Z = (1.0 / math.pi) * torch.atan(S * self.inv_norm) + 0.5
         return self.normal.icdf(Z)
 
 
 class BrownResnickMap(BaseMap):
-    """Deterministic map from iid standard-Gaussian samples to a
-    Brown-Resnick max-stable field with standard-Gaussian marginals.
+    """Brown-Resnick max-stable field on an ``H x W`` grid, with standard normal
+    marginals.
 
-    Finite-L truncation of the de Haan spectral representation:
+    Uses the de Haan spectral representation, truncated at ``L`` storms::
 
-        Z(s) = max_{l=1..L}  xi_l * exp(W_l(s) - gamma(s))
+        Z(s) = max_{l=1..L} xi_l exp(W_l(s) - gamma(s))
 
-      - xi_l   = 1 / Gamma_l,  Gamma_l = E_1 + ... + E_l   (unit-rate Poisson arrivals)
-      - W_l    ~ GP(0, K)  iid "storms", drawn from the full kernel
-      - gamma(s) = 0.5 * Var(W(s)) = 0.5 * diag(K)         (normalises each storm to unit mean)
+    - ``xi_l = 1 / Gamma_l``, with ``Gamma_l = E_1 + ... + E_l`` the arrival times of
+      a unit-rate Poisson process;
+    - ``W_l ~ GP(0, K)`` iid "storms";
+    - ``gamma(s) = 0.5 diag(K)``, which gives each ``exp(W_l(s) - gamma(s))`` unit
+      mean.
 
-    As L -> infinity, Z(s) has unit-Frechet margins  P(Z <= z) = exp(-1/z).
+    As ``L`` grows, ``Z(s)`` has unit-Frechet marginals ``P(Z <= z) = exp(-1/z)``; the
+    map returns ``Phi^{-1}(exp(-1/Z))``, with standard normal marginals.
 
-    We finally push to Gaussian margins via  G = Phi^{-1}(exp(-1/Z))
+    Args:
+        H: grid height.
+        W: grid width.
+        kernel: the storm kernel ``K``. Sets the map's dtype.
+        num_storms: number of storms ``L``.
+        device: device of the map's tensors.
+        jitter: added to the diagonal of ``K`` before its Cholesky factorisation.
     """
 
     def __init__(
@@ -179,55 +219,63 @@ class BrownResnickMap(BaseMap):
         device="cpu",
         jitter=1e-8,
     ):
-        num_latents = (
-            H * W * num_storms + num_storms
-        )  # L storms x N grid points, plus L Poisson arrivals
+        # One latent per grid point per storm, plus one per Poisson arrival.
+        num_latents = H * W * num_storms + num_storms
         super().__init__(num_latents, (H, W), device=device, dtype=kernel.dtype)
         self.H, self.W = H, W
         self.L = num_storms
 
-        # Exact full-rank storm factor: W_l = z_l @ L_K^T draws GP(0, K), since L_K L_K^T = K.
+        # Storms are drawn exactly as W_l = L_K z_l.
         K, L_K = _gp_cholesky(H, W, kernel, jitter, device)
         self.register_buffer("L_K", L_K)  # (N, N)
         self.register_buffer("gamma", 0.5 * K.diagonal().clone())  # (N,)
 
     def _map(self, z: torch.Tensor) -> torch.Tensor:
-        """z: (B, C, L*(1+N)) iid N(0,1)  ->  (B, C, N)."""
+        """``(B, C, L (1 + N))`` latents to a ``(B, C, N)`` field."""
         B, C = z.shape[0], z.shape[1]
         z = z.reshape(B, C, self.L, 1 + self.output_dim)
 
         z_pois = z[..., 0]  # (B, C, L)
         z_gp = z[..., 1:]  # (B, C, L, N)
 
-        # Poisson arrivals from Gaussians:  U = Phi(z) ~ Unif(0,1),  E = -log U ~ Exp(1)
+        # Poisson arrivals: U = Phi(z) ~ Uniform(0, 1), E = -log U ~ Exp(1).
         u = _unit_clamp(self.normal.cdf(z_pois))
         E = -torch.log(u)
         Gamma = torch.cumsum(E, dim=-1)  # (B, C, L)
-        log_xi = -torch.log(Gamma)  # log(1 / Gamma_l)
+        log_xi = -torch.log(Gamma)
 
-        # iid exact full-rank storms, per-storm log-intensity  log(xi_l) + W_l(s) - gamma(s)
+        # Per-storm log-intensity log(xi_l) + W_l(s) - gamma(s).
         storms = torch.einsum("...ln,mn->...lm", z_gp, self.L_K)  # (B, C, L, N)
         log_terms = log_xi[..., None] + storms - self.gamma
 
-        # exact max-stable pooling over storms (hard max, sparse grad)
+        # Max over storms (a hard max, so the gradient is sparse).
         log_Z = log_terms.amax(dim=-2)  # (B, C, N)
 
-        # Frechet -> Uniform -> Gaussian marginals:  U = exp(-1/Z) = exp(-exp(-log Z))
+        # Frechet -> Uniform -> Gaussian: U = exp(-1/Z) = exp(-exp(-log Z)).
         U_out = _unit_clamp(torch.exp(-torch.exp(-log_Z)))
         return self.normal.icdf(U_out)  # (B, C, N)
 
 
 class StudentTProcessMap(BaseMap):
-    """Student-t process — GP with a shared chi-squared mixing variable.
+    """Student-t process on an ``H x W`` grid, with ``t_nu(0, 1)`` marginals.
 
-    Representation:  Z(s) = G(s) / sqrt(V / nu)
+    A GP divided by one shared chi-squared variable per sample::
 
-      G ~ GP(0, K)   spatially correlated Gaussian field (exact full-rank Cholesky)
-      V ~ chi^2(nu)  one shared variance multiplier per sample (elliptical mixing)
-                     drawn from nu iid N(0,1) latents via  V = sum_k z_k^2
+        Z(s) = G(s) / (sqrt(V / nu) sqrt(K(s, s)))
 
-    Marginals are exactly  Z(s) ~ t_nu(0, 1)  (unit scale, after dividing each site
-    by its pointwise GP std sqrt(K_ss)).
+    - ``G ~ GP(0, K)``, drawn exactly via the Cholesky factor of ``K``;
+    - ``V = z_1^2 + ... + z_nu^2 ~ chi^2(nu)``, from ``nu`` further latents.
+
+    Dividing by the pointwise standard deviation ``sqrt(K(s, s))`` gives each site
+    exactly a ``t_nu(0, 1)`` marginal.
+
+    Args:
+        H: grid height.
+        W: grid width.
+        kernel: the GP kernel ``K``. Sets the map's dtype.
+        nu: degrees of freedom.
+        device: device of the map's tensors.
+        jitter: added to the diagonal of ``K`` before its Cholesky factorisation.
     """
 
     def __init__(
@@ -239,9 +287,8 @@ class StudentTProcessMap(BaseMap):
         device="cpu",
         jitter=1e-8,
     ):
-        num_latents = (
-            H * W + nu
-        )  # N grid points for the GP field, plus nu latents for the chi-squared mixer
+        # One latent per grid point for the GP, plus nu for the chi-squared variable.
+        num_latents = H * W + nu
         super().__init__(num_latents, (H, W), device=device, dtype=kernel.dtype)
         self.H, self.W = H, W
         self.nu = nu
@@ -251,27 +298,33 @@ class StudentTProcessMap(BaseMap):
         self.register_buffer("k_diag_sqrt", _k_diag_sqrt(K))  # (N,)
 
     def _map(self, z: torch.Tensor) -> torch.Tensor:
-        """z: (B, C, N+nu) iid N(0,1)  ->  (B, C, N), t_nu(0,1) marginals."""
+        """``(B, C, N + nu)`` latents to a ``(B, C, N)`` field."""
         z_gp = z[..., : self.output_dim]  # (B, C, N)
         z_chi = z[..., self.output_dim :]  # (B, C, nu)
 
-        G = z_gp @ self.L_K.t()  # (B, C, N)  GP(0, K)
-        V = (z_chi**2).sum(dim=-1).clamp(min=1e-6)  # (B, C)  chi^2(nu)
-        # Normalise so each marginal is exactly t_nu(0, 1)
+        G = z_gp @ self.L_K.t()  # (B, C, N), GP(0, K)
+        V = (z_chi**2).sum(dim=-1).clamp(min=1e-6)  # (B, C), chi^2(nu)
         return G / (torch.sqrt(V[..., None] / self.nu) * self.k_diag_sqrt)
 
 
 class LogGaussianCoxMap(BaseMap):
-    """Deterministic, differentiable map from iid standard-Gaussian samples to a
-    log-Gaussian Cox process (LGCP).
+    """Intensity surface of a log-Gaussian Cox process on an ``H x W`` grid.
 
-    The latent log-intensity is a Gaussian field, drawn exactly from the kernel:
+    The log-intensity is a GP, drawn exactly via the Cholesky factor of ``K``::
 
-        G(s)      = mu + (z_gp @ L_K^T)(s),   L_K L_K^T = K          (GP(mu, K))
-        Lambda(s) = exp(G(s))                                        (intensity surface)
+        G(s) = mu + (L_K z)(s) ~ GP(mu, K)
+        Lambda(s) = exp(G(s))
 
-    By default the map returns the *intensity field* Lambda(s) -- a smooth, positive,
-    fully differentiable surface (this is the random object that defines the Cox process).
+    The map returns the intensity ``Lambda``, a positive, differentiable surface; it
+    is the random object that defines the Cox process.
+
+    Args:
+        H: grid height.
+        W: grid width.
+        kernel: the kernel ``K`` of the log-intensity. Sets the map's dtype.
+        mu: constant mean of the log-intensity.
+        device: device of the map's tensors.
+        jitter: added to the diagonal of ``K`` before its Cholesky factorisation.
     """
 
     def __init__(
@@ -288,36 +341,39 @@ class LogGaussianCoxMap(BaseMap):
         self.mu = mu
 
         _, L_K = _gp_cholesky(H, W, kernel, jitter, device)
-        self.register_buffer("L_K", L_K)  # (grid, grid)
+        self.register_buffer("L_K", L_K)  # (N, N)
 
     def _map(self, z: torch.Tensor) -> torch.Tensor:
-        """z: (B, C, N) iid N(0,1)  ->  (B, C, N): intensity surface Lambda(s)."""
+        """``(B, C, N)`` latents to a ``(B, C, N)`` intensity surface."""
         log_lambda = self.mu + z @ self.L_K.t()
         return torch.exp(log_lambda)
 
 
 class LevyNIGMap(BaseMap):
-    """Deterministic, differentiable map from iid standard-Gaussian samples to a
-    Levy / Normal-Inverse-Gaussian (NIG) random field.
+    """Normal-Inverse-Gaussian (NIG) random field on an ``H x W`` grid.
 
-    Uses the normal variance-mean mixture representation of the NIG law: an NIG
-    variate is a Gaussian whose variance is itself Inverse-Gaussian (the IG is the
-    Levy subordinator). Spatially, we subordinate a *correlated* Gaussian field by a
-    single per-sample IG variance W, so each marginal is exactly NIG(alpha,beta,mu,delta)
-    while the spatial dependence comes from the kernel:
+    Uses the normal variance-mean mixture form of the NIG law: a Gaussian whose
+    variance is Inverse-Gaussian (IG). A correlated Gaussian field is mixed with one
+    IG variable per sample::
 
-        W      ~ IG(delta, gamma),   gamma = sqrt(alpha^2 - beta^2)     (one per sample)
-        G(s)   ~ GP(0, R),           R = unit-diagonal (correlation) kernel
-        Z(s)   = mu + beta * W + sqrt(W) * G(s)
+        W ~ IG(delta, gamma), gamma = sqrt(alpha^2 - beta^2)
+        G ~ GP(0, R), R the correlation kernel (K scaled to unit diagonal)
+        Z(s) = mu + beta W + sqrt(W) G(s)
 
-    G is drawn from the raw kernel and divided by its pointwise std sqrt(diag(K)) to
-    give the unit-diagonal R — the same normalisation StudentTProcessMap applies.
+    so each marginal is exactly ``NIG(alpha, beta, mu, delta)``: heavy-tailed, and
+    skewed when ``beta != 0``. The latents are one per grid point for ``G``, plus two
+    for drawing ``W`` with the Michael-Schucany-Haas sampler.
 
-    Marginally  Z(s) ~ NIG(alpha, beta, mu, delta), heavy-tailed and (for beta != 0) skewed.
-
-    Latents per sample: N grid values for the storm/field G, plus 2 scalars used to
-    draw W via the Michael-Schucany-Haas IG sampler (one chi-square magnitude + one
-    branch coin).
+    Args:
+        H: grid height.
+        W: grid width.
+        kernel: the kernel ``K`` of the Gaussian field. Sets the map's dtype.
+        alpha: tail heaviness; must exceed ``|beta|``.
+        beta: skewness.
+        delta: scale.
+        mu: location.
+        device: device of the map's tensors.
+        jitter: added to the diagonal of ``K`` before its Cholesky factorisation.
     """
 
     def __init__(
@@ -333,7 +389,7 @@ class LevyNIGMap(BaseMap):
         jitter=1e-8,
     ):
         assert alpha > abs(beta), "NIG requires alpha > |beta|"
-        # latent layout: H*W for the GP field + 1 (IG magnitude) + 1 (IG branch)
+        # Latents: H*W for the GP field, then the IG magnitude and branch variables.
         super().__init__(H * W + 2, (H, W), device=device, dtype=kernel.dtype)
         self.H, self.W = H, W
 
@@ -347,16 +403,19 @@ class LevyNIGMap(BaseMap):
         self.ig_shape = delta * delta
 
         K, L_K = _gp_cholesky(H, W, kernel, jitter, device)
-        self.register_buffer("L_K", L_K)  # (grid, grid)
-        # divide by the pointwise GP std so the field has unit marginals (R, not K),
-        # making each marginal exactly NIG(alpha, beta, mu, delta)
-        self.register_buffer("k_diag_sqrt", _k_diag_sqrt(K))  # (grid,)
+        self.register_buffer("L_K", L_K)  # (N, N)
+        # Dividing by the pointwise std turns a GP(0, K) draw into a GP(0, R) one.
+        self.register_buffer("k_diag_sqrt", _k_diag_sqrt(K))  # (N,)
 
     def _sample_ig(self, z_mag: torch.Tensor, z_branch: torch.Tensor) -> torch.Tensor:
-        """Michael-Schucany-Haas: draw W ~ IG(mean=ig_mean, shape=ig_shape) from Gaussians."""
+        """Draw ``W ~ IG(mean=ig_mean, shape=ig_shape)`` from two standard normals.
+
+        The Michael-Schucany-Haas method: ``z_mag`` gives the chi-squared variable
+        and ``z_branch`` the uniform that picks one of the two roots.
+        """
         mu_w = self.ig_mean
         lam = self.ig_shape
-        y = z_mag * z_mag  # chi-square(1)
+        y = z_mag * z_mag  # chi^2(1)
         x1 = (
             mu_w
             + (mu_w * mu_w * y) / (2 * lam)
@@ -367,9 +426,9 @@ class LevyNIGMap(BaseMap):
         return torch.where(accept, x1, (mu_w * mu_w) / x1)
 
     def _map(self, z: torch.Tensor) -> torch.Tensor:
-        """z: (B, C, N + 2) iid N(0,1)  ->  (B, C, N) NIG field."""
+        """``(B, C, N + 2)`` latents to a ``(B, C, N)`` field."""
         n = self.output_dim
         z_gp = z[..., :n]  # (B, C, N)
         w = self._sample_ig(z[..., n], z[..., n + 1])  # (B, C)
-        G = (z_gp @ self.L_K.t()) / self.k_diag_sqrt  # (B, C, N)  GP(0, R)
+        G = (z_gp @ self.L_K.t()) / self.k_diag_sqrt  # (B, C, N), GP(0, R)
         return self.mu + self.beta * w[..., None] + w.sqrt()[..., None] * G

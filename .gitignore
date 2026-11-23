@@ -46,7 +46,6 @@ cover/
 
 # Output / results
 results/
-benchmarks/
 *.log
 *.npz
 figs/figures

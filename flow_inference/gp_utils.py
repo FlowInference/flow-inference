@@ -1,20 +1,25 @@
-"""Gaussian-process helpers — everything in the package that talks to gpytorch.
+"""Gaussian-process helpers built on gpytorch.
 
-* :func:`fit_kernel_hyperparameters` — type-II maximum likelihood for a kernel's
-  hyperparameters. Fitting and conditioning are separate steps: fit first, then call
-  :func:`gp_posterior` to build the posterior, then hand that to
-  ``GaussianProcessFlow``.
-* :class:`PosteriorKernel` / :class:`PosteriorMean` — the posterior covariance and
-  mean wrapped as a callable ``gpytorch.kernels.Kernel`` and ``gpytorch.means.Mean``.
-  gpytorch exposes the posterior only as a ``MultivariateNormal`` over a fixed set of
-  points; these make it evaluable at arbitrary inputs like any other kernel/mean.
-* :func:`gp_posterior` — builds :class:`PosteriorMean` and :class:`PosteriorKernel`
-  together, sharing one Cholesky factorisation of the training Gram matrix.
-* :class:`AbstractBasis` — finite basis expansions, used to run the diffusion over
-  ``R`` weights instead of ``N`` grid values. :class:`RFFBasis` expands a stationary
-  prior kernel and has closed-form derivatives of its basis functions;
-  :class:`DecoupledRFFBasis` is the conditioned counterpart, giving a GP *posterior*
-  as a basis via pathwise conditioning (Wilson et al. 2020).
+A typical GP workflow fits the kernel, conditions on data, and hands the posterior to
+a flow::
+
+    kernel = fit_kernel_hyperparameters(X, y, kernel, noise=1e-4)
+    mean, post_kernel = gp_posterior(kernel, X, y, noise=1e-4)
+    flow = GaussianProcessFlow(post_kernel, mean, grid)
+
+* :func:`fit_kernel_hyperparameters`: type-II maximum likelihood for a kernel's
+  hyperparameters.
+* :func:`gp_posterior`: the posterior mean and kernel, as :class:`PosteriorMean` and
+  :class:`PosteriorKernel`. These are an ordinary ``gpytorch.means.Mean`` and
+  ``gpytorch.kernels.Kernel``, so the posterior can be evaluated at any inputs.
+* :class:`AbstractBasis`: finite basis expansions of a GP, so that
+  :class:`~flow_inference.flows.BasisGaussianProcessFlow` can diffuse over ``R``
+  weights rather than ``N`` grid values. :class:`RFFBasis` expands a stationary prior
+  with closed-form derivatives; :class:`DecoupledRFFBasis` does the same for a GP
+  posterior, via pathwise conditioning (Wilson et al. 2020).
+
+Factorisations of the training Gram matrix are done in float64, since it is badly
+conditioned; everything else runs in the kernel's dtype.
 """
 
 import logging
@@ -26,6 +31,8 @@ import torch
 from gpytorch.kernels import RFFKernel, ScaleKernel
 from tqdm.auto import tqdm
 
+from flow_inference.flow_utils import float64_copy
+
 logger = logging.getLogger(__name__)
 
 
@@ -36,32 +43,37 @@ def _train_cholesky(
 ) -> torch.Tensor:
     """Lower Cholesky factor of the training Gram matrix ``K_XX + noise I``.
 
-    Shared by :class:`PosteriorKernel` and :class:`PosteriorMean` — both condition on
-    the same training set, and this is the only expensive part of doing so.
+    The one expensive step in conditioning a GP, shared by :class:`PosteriorKernel`,
+    :class:`PosteriorMean` and :class:`DecoupledRFFBasis`. Computed in float64: with
+    near-noiseless observations (noise ~1e-10) the matrix is not numerically positive
+    definite in float32.
     """
-    eye = torch.eye(train_x.shape[0], dtype=train_x.dtype, device=train_x.device)
-    K_xx = base_kernel(train_x, train_x).to_dense() + noise * eye
-    return torch.linalg.cholesky(K_xx)
+    x = train_x.detach().to(torch.float64)
+    eye = torch.eye(x.shape[0], dtype=torch.float64, device=x.device)
+    with torch.no_grad():  # a fixed factor: nothing to differentiate
+        K_xx = float64_copy(base_kernel)(x, x).to_dense() + noise * eye
+        return torch.linalg.cholesky(K_xx)
 
 
 class PosteriorKernel(gpytorch.kernels.Kernel):
-    """GP posterior covariance as a callable kernel.
+    """GP posterior covariance as a gpytorch kernel.
+
+    Computes
 
         k_post(x, x') = k(x, x') - k(x, X) [K_XX + noise I]^-1 k(X, x')
 
-    gpytorch has no posterior-kernel object — the posterior is only reachable as a
-    ``MultivariateNormal`` over a fixed set of points (``model(X_test).covariance_matrix``).
-    This wraps the same quantity as a ``Kernel``, so it can be evaluated at arbitrary
-    inputs, composed, and passed anywhere a kernel is expected.
+    at any inputs, so the posterior can be passed anywhere a kernel is expected, such
+    as :class:`~flow_inference.flows.GaussianProcessFlow`. (gpytorch itself gives the
+    posterior only as a ``MultivariateNormal`` over fixed test points.) Usually built
+    together with :class:`PosteriorMean` by :func:`gp_posterior`.
 
-    The Cholesky factor of the training Gram matrix is computed once in ``__init__``
-    and registered as a buffer, so repeated evaluation is a triangular solve.
+    The Cholesky factor of ``K_XX + noise I`` is computed once, in float64, so each
+    evaluation is a triangular solve; the solve is also float64, and the kernel
+    itself is evaluated in the inputs' dtype.
 
-    Note this kernel is **not stationary**: the posterior variance collapses near the
-    training inputs and returns to the prior far from them. Anything relying on
-    stationarity — Bochner's theorem, and hence :class:`RFFBasis` — does not apply to
-    it. For a finite basis of the posterior use :class:`DecoupledRFFBasis`, which
-    expands only the stationary prior and applies the data correction exactly.
+    The posterior kernel is **not stationary**: its variance collapses near the
+    training inputs. Random Fourier features (:class:`RFFBasis`) therefore do not
+    apply to it; use :class:`DecoupledRFFBasis` for a finite basis of the posterior.
 
     Args:
         base_kernel: the prior kernel k.
@@ -86,33 +98,39 @@ class PosteriorKernel(gpytorch.kernels.Kernel):
         super().__init__()
         self.base_kernel = base_kernel
         self.register_buffer("train_x", train_x)
-        # _L lets :func:`gp_posterior` hand in a factor it already computed.
+        # _L lets gp_posterior pass in a factor it has already computed.
         L = _train_cholesky(base_kernel, train_x, noise) if _L is None else _L
         self.register_buffer("L", L)
 
     def forward(
         self, x1: torch.Tensor, x2: torch.Tensor, diag: bool = False, **params
     ) -> torch.Tensor:
+        """Posterior covariance ``(N1, N2)`` between ``x1`` and ``x2``, or its
+        diagonal ``(N,)`` when ``diag``."""
+        train_x = self.train_x.to(x1.dtype)
         k12 = self.base_kernel(x1, x2).to_dense()
-        k1X = self.base_kernel(x1, self.train_x).to_dense()
-        kX2 = self.base_kernel(self.train_x, x2).to_dense()
-        out = k12 - k1X @ torch.cholesky_solve(kX2, self.L)
+        k1X = self.base_kernel(x1, train_x).to_dense()
+        kX2 = self.base_kernel(train_x, x2).to_dense()
+        # Only the solve needs float64: it inherits K_XX's conditioning.
+        L = self.L.to(torch.float64)
+        correction = k1X.to(L.dtype) @ torch.cholesky_solve(kX2.to(L.dtype), L)
+        out = k12 - correction.to(k12.dtype)
         return out.diagonal(dim1=-2, dim2=-1) if diag else out
 
 
 class PosteriorMean(gpytorch.means.Mean):
-    """GP posterior mean as a callable mean function.
+    """GP posterior mean as a gpytorch mean function.
+
+    Computes
 
         m_post(x) = m(x) + k(x, X) [K_XX + noise I]^-1 (y - m(X))
 
-    The companion to :class:`PosteriorKernel`: gpytorch gives you the posterior mean
-    only as ``model(X_test).mean`` over a fixed set of points, whereas this evaluates
-    at arbitrary inputs and drops into anything expecting a ``gpytorch.means.Mean``
-    (an ``ExactGP``'s ``mean_module``, for instance).
+    at any inputs, so the posterior mean can be passed anywhere a
+    ``gpytorch.means.Mean`` is expected. The companion to :class:`PosteriorKernel`;
+    :func:`gp_posterior` builds both.
 
-    The representer weights ``alpha = [K_XX + noise I]^-1 (y - m(X))`` are solved once
-    in ``__init__`` and stored, so evaluation is a single matmul — the same trick as
-    gpytorch's internal ``mean_cache``.
+    The weights ``alpha = [K_XX + noise I]^-1 (y - m(X))`` are solved once, in
+    float64, so each evaluation is a single matmul.
 
     Args:
         base_kernel: the prior kernel k.
@@ -143,14 +161,22 @@ class PosteriorMean(gpytorch.means.Mean):
             gpytorch.means.ZeroMean() if prior_mean is None else prior_mean
         )
         self.register_buffer("train_x", train_x)
-        # _L lets :func:`gp_posterior` hand in a factor it already computed.
+        # _L lets gp_posterior pass in a factor it has already computed.
         L = _train_cholesky(base_kernel, train_x, noise) if _L is None else _L
-        residual = (train_y - self.prior_mean(train_x)).unsqueeze(-1)  # (N, 1)
-        self.register_buffer("alpha", torch.cholesky_solve(residual, L).squeeze(-1))
+        L = L.detach().to(torch.float64)
+        x64 = train_x.detach().to(torch.float64)
+        with torch.no_grad():
+            prior_at_x = float64_copy(self.prior_mean)(x64).to(torch.float64)
+            residual = (train_y.detach().to(torch.float64) - prior_at_x).unsqueeze(-1)
+            alpha = torch.cholesky_solve(residual, L).squeeze(-1)  # (N,)
+        self.register_buffer("alpha", alpha)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        k_xX = self.base_kernel(x, self.train_x).to_dense()  # (M, N)
-        return self.prior_mean(x) + k_xX @ self.alpha
+        """Posterior mean ``(M,)`` at ``x`` ``(M, D)``."""
+        k_xX = self.base_kernel(x, self.train_x.to(x.dtype)).to_dense()  # (M, N)
+        # alpha is applied in float64: it inherits K_XX's conditioning.
+        alpha = self.alpha.to(torch.float64)
+        return self.prior_mean(x) + (k_xX.to(alpha.dtype) @ alpha).to(k_xX.dtype)
 
 
 def gp_posterior(
@@ -160,14 +186,21 @@ def gp_posterior(
     noise: float | torch.Tensor = 1e-4,
     prior_mean: gpytorch.means.Mean | None = None,
 ) -> tuple["PosteriorMean", "PosteriorKernel"]:
-    """Posterior mean *and* kernel, sharing a single Cholesky factorisation.
+    """GP posterior mean and kernel, conditioned on ``(train_x, train_y)``.
 
-    :class:`PosteriorMean` and :class:`PosteriorKernel` each condition on the same
-    training set, so building them separately factorises ``K_XX + noise I`` twice —
-    the only O(N^3) step involved. This does it once and hands the factor to both.
+    Builds :class:`PosteriorMean` and :class:`PosteriorKernel` with a single shared
+    Cholesky factorisation of ``K_XX + noise I``, the only O(N^3) step.
 
-    Returns ``(mean, kernel)``, matching the argument order
-    :class:`~flow_inference.flows.GaussianProcessFlow` expects.
+    Args:
+        base_kernel: the prior kernel k.
+        train_x: training inputs ``(N, D)``.
+        train_y: training targets ``(N,)``.
+        noise: observation noise variance.
+        prior_mean: prior mean function. Defaults to ``ZeroMean``.
+
+    Returns:
+        ``(mean, kernel)``, ready to pass to
+        :class:`~flow_inference.flows.GaussianProcessFlow`.
 
     Example:
         >>> mean, kernel = gp_posterior(rbf, X_train, y_train, noise=1e-4)
@@ -196,34 +229,40 @@ def fit_kernel_hyperparameters(
         f ~ GP(0, k),   y = f(X) + eps,  eps ~ N(0, noise I)
 
     The mean is held at zero and ``noise`` is held fixed; only the kernel's own
-    hyperparameters (lengthscale, outputscale, ...) are optimised.
-
-    ``kernel`` is used as the model's ``covar_module``, so it is fitted **in place**
-    and also returned for chaining. Building the posterior is a separate step —
-    see :func:`gp_posterior`:
+    hyperparameters (lengthscale, outputscale, ...) are optimised. ``kernel`` is
+    fitted **in place** and also returned. Conditioning on the data is a separate
+    step, :func:`gp_posterior`:
 
         >>> kernel = fit_kernel_hyperparameters(X, y, kernel, noise=1e-4)
         >>> mean, post_kernel = gp_posterior(kernel, X, y, noise=1e-4)
         >>> flow = GaussianProcessFlow(post_kernel, mean, grid)
 
+    The optimisation runs on a float64 copy of the kernel, since each step factorises
+    ``K_XX + noise I``; the fitted values are then loaded back into ``kernel``.
+
     Args:
         X_train: ``(N, D)`` training inputs.
         y_train: ``(N,)`` training targets.
-        kernel: the kernel to fit; mutated in place.
+        kernel: the kernel to fit; modified in place.
         noise: observation noise variance, held fixed during fitting.
-        num_iters: Adam steps on the negative marginal log-likelihood.
+        num_iters: Adam steps on the negative log marginal likelihood.
         lr: Adam learning rate.
-        verbose: log the loss every 100 steps and the fitted hyperparameters.
+        device: device to fit on.
+        verbose: show a progress bar with the loss, and log the fitted
+            hyperparameters.
 
     Returns:
         The same ``kernel`` object, with fitted hyperparameters.
     """
+    fit_kernel = float64_copy(kernel)
+    X_train = X_train.detach().to(device=device, dtype=torch.float64)
+    y_train = y_train.detach().to(device=device, dtype=torch.float64)
 
     class ExactGPModel(gpytorch.models.ExactGP):
         def __init__(self, train_x, train_y, likelihood):
             super().__init__(train_x, train_y, likelihood)
             self.mean_module = gpytorch.means.ZeroMean()
-            self.covar_module = kernel
+            self.covar_module = fit_kernel
 
         def forward(self, x):
             return gpytorch.distributions.MultivariateNormal(
@@ -232,10 +271,12 @@ def fit_kernel_hyperparameters(
 
     likelihood = gpytorch.likelihoods.GaussianLikelihood(
         noise_constraint=gpytorch.constraints.GreaterThan(1e-20)
-    ).to(device)
+    ).to(device=device, dtype=torch.float64)
     likelihood.noise = noise
-    likelihood.raw_noise.requires_grad_(False)  # noise is given, not fitted
-    model = ExactGPModel(X_train, y_train, likelihood).to(device)
+    likelihood.raw_noise.requires_grad_(False)  # the noise is given, not fitted
+    model = ExactGPModel(X_train, y_train, likelihood).to(
+        device=device, dtype=torch.float64
+    )
 
     model.train()
     likelihood.train()
@@ -244,15 +285,19 @@ def fit_kernel_hyperparameters(
     pbar = tqdm(range(num_iters), disable=not verbose, desc="fitting kernel")
     for i in pbar:
         optimizer.zero_grad()
-        loss = -mll(model(X_train), y_train)  # negative log marginal likelihood
+        loss = -mll(model(X_train), y_train)
         loss.backward()
         optimizer.step()
         if i % 100 == 0:
             pbar.set_postfix(neg_mll=f"{loss.item():.3f}")
 
+    model.eval()
+    likelihood.eval()
+    # load_state_dict casts the fitted values to the caller's kernel's dtype.
+    kernel.load_state_dict(fit_kernel.state_dict())
+
     if verbose:
-        # Not every kernel exposes base_kernel/outputscale (e.g. a bare RBFKernel),
-        # so report whichever hyperparameters this one actually has.
+        # Not every kernel has base_kernel/outputscale (e.g. a bare RBFKernel).
         for name, obj in [
             ("lengthscale", getattr(kernel, "base_kernel", None)),
             ("outputscale", kernel),
@@ -260,70 +305,52 @@ def fit_kernel_hyperparameters(
             if obj is not None and hasattr(obj, name):
                 logger.info("%s is %s", name, getattr(obj, name))
 
-    model.eval()
-    likelihood.eval()
     return kernel
 
 
 class AbstractBasis(ABC):
     """A finite basis expansion of a GP.
 
-    A basis represents draws as ``f(x) = sum_r w_r phi_r(x) + m(x)`` with iid standard
-    normal weights ``w``, so the induced covariance is ``Phi(x)^T Phi(x)``. That lets
-    the diffusion run over ``R`` weights instead of ``N`` grid values — the point of
-    the weight-space formulation.
+    A basis writes draws as ``f(x) = sum_r w_r phi_r(x) + m(x)`` with iid standard
+    normal weights ``w``, so the induced covariance is ``Phi(x)^T Phi(x)``. This lets
+    :class:`~flow_inference.flows.BasisGaussianProcessFlow` diffuse over ``R`` weights
+    rather than ``N`` grid values.
 
-    The basis is **grid-free**: it holds only what defines the expansion (``R``, the
-    kernel, the mean), and every method takes the points to evaluate at. The grid
-    belongs to whoever is using the basis —
-    :class:`~flow_inference.flows.BasisGaussianProcessFlow` evaluates ``Phi`` once in
-    its constructor and stores it, the way ``GaussianProcessFlow`` stores its whitening
-    factor.
+    A basis is not tied to a grid: it holds only what defines the expansion (``R``,
+    the kernel, the mean), and every method takes the points to evaluate at.
 
-    Subclasses supply :meth:`_get_basis_params` (whatever the basis precomputes once,
-    independent of any grid) and :meth:`phi` (the ``(R, N)`` design matrix at given
-    points). Everything downstream follows from ``phi``.
-
-    :meth:`compute_derivative` is *optional*. A Fourier basis (:class:`RFFBasis`) has
-    it in closed form; a basis defined only by values at sample points — an
-    eigen/Nystrom expansion, say — does not, so the default raises.
+    Subclasses implement :meth:`_get_basis_params` (any grid-independent
+    precomputation) and :meth:`phi` (the ``(R, N)`` design matrix at given points).
+    They may also implement :meth:`compute_derivative`, when the basis functions have
+    closed-form derivatives (as for :class:`RFFBasis`); the default raises.
 
     Args:
-        R (int): Number of basis functions.
-        input_dim (int): Dimension ``D`` of the input space. Needed at construction
-            because the expansion itself depends on it (RFF frequencies are
-            ``(D, R/2)``), even though no grid is fixed yet.
-        mean (gpytorch.means.Mean): Mean function, added back in
-            :meth:`sample_functions`. Stored as ``mean_module``; call it through
-            :meth:`mean`, which coerces its argument like :meth:`phi` does.
-        kernel (gpytorch.kernels.Kernel): The kernel being approximated.
-        device (torch.device or str): Device for the stored tensors.
-        dtype (torch.dtype): Working precision. Defaults to the kernel's dtype.
+        R (int): number of basis functions.
+        input_dim (int): dimension ``D`` of the input space.
+        mean (gpytorch.means.Mean): mean function, added in
+            :meth:`sample_functions`. Stored as ``mean_module``; evaluate it with
+            :meth:`mean`.
+        kernel (gpytorch.kernels.Kernel): the kernel being approximated.
+        device (torch.device or str): device for the stored tensors.
+        dtype (torch.dtype): working precision. Defaults to the kernel's dtype.
     """
 
     def __init__(self, R, input_dim, mean, kernel, device="cpu", dtype=None):
         self.device = device
-        # Follow the kernel unless overridden. The mean and kernel are gpytorch
-        # modules the caller built, and calling one at a dtype it was not built at
-        # raises inside gpytorch's sq_dist rather than promoting, so pinning a
-        # dtype here would break any caller who did not also set the ambient default.
+        # Default to the kernel's dtype: gpytorch modules raise, rather than promote,
+        # when called at a dtype they were not built at.
         self.dtype = kernel.dtype if dtype is None else dtype
         self.R = R
         self.input_dim = input_dim
         self.mean_module = mean
         self.kernel = kernel
-
-        # grid-independent precomputation (RFF frequencies, and so on)
         self._get_basis_params()
 
     def mean(self, x: torch.Tensor) -> torch.Tensor:
-        """Prior/posterior mean at ``x`` ``(N, D)``, shape ``(N,)``.
+        """Mean function at ``x`` ``(N, D)``, shape ``(N,)``.
 
-        A method rather than the bare gpytorch module, so that ``basis.mean(x)``
-        coerces ``x`` exactly like :meth:`phi` does. Called directly, a
-        ``gpytorch.means.Mean`` raises on any dtype it was not built at instead of
-        promoting — the grid is float64 by default while a kernel built under the
-        ambient default is float32, so the raw module fails on the common path.
+        Coerces ``x`` to the basis's device and dtype first, as :meth:`phi` does;
+        the raw gpytorch module raises on a dtype it was not built at.
         """
         return self.mean_module(self._as_points(x)).reshape(-1).to(dtype=self.dtype)
 
@@ -343,7 +370,7 @@ class AbstractBasis(ABC):
     def approximate_kernel(self, x: torch.Tensor) -> torch.Tensor:
         """Kernel matrix induced by the basis at ``x``: ``Phi^T Phi``, shape ``(N, N)``.
 
-        How close this is to ``kernel(x, x)`` is what ``R`` buys.
+        Approaches ``kernel(x, x)`` as ``R`` grows.
         """
         Phi = self.phi(x)
         return torch.einsum("rn,rm->nm", Phi, Phi)
@@ -351,8 +378,13 @@ class AbstractBasis(ABC):
     def compute_derivative(self, x: torch.Tensor, dims, orders) -> torch.Tensor:
         """Mixed partial derivatives of the basis functions at ``x``, shape ``(R, N)``.
 
-        Optional: only bases whose basis functions have a closed form can provide
-        this. Bases defined pointwise cannot.
+        Only available for bases whose basis functions have a closed form; this
+        default raises.
+
+        Args:
+            x: evaluation points ``(N, D)``.
+            dims: the input dimensions to differentiate along.
+            orders: the derivative order for each entry of ``dims``.
         """
         raise NotImplementedError(
             f"{type(self).__name__} has no closed-form derivatives. Use a basis with "
@@ -362,17 +394,20 @@ class AbstractBasis(ABC):
     def mean_derivative(self, x: torch.Tensor, dims, orders) -> torch.Tensor:
         """Mixed partials of the mean function at ``x``, shape ``(N,)``.
 
-        A sampled function is ``w @ phi(x) + mean(x)``, so a derivative constraint
-        needs **both** terms::
+        A sampled function is ``w @ phi(x) + mean(x)``, so its derivative needs both
+        terms::
 
             df = w @ basis.compute_derivative(x, dims, orders) \
                  + basis.mean_derivative(x, dims, orders)
 
-        This exists on the base class so the second term can never be silently
-        forgotten: it returns zeros for a ``ZeroMean`` (the common case, where dropping
-        it happens to be harmless) and raises otherwise, rather than leaving callers to
-        notice that their mean has a derivative. :class:`DecoupledRFFBasis` overrides it
-        — a posterior mean's derivative is large, not negligible.
+        This default returns zeros for a ``ZeroMean`` and raises for any other mean,
+        so a non-zero mean derivative is never silently dropped.
+        :class:`DecoupledRFFBasis` overrides it for its posterior mean.
+
+        Args:
+            x: evaluation points ``(N, D)``.
+            dims: the input dimensions to differentiate along.
+            orders: the derivative order for each entry of ``dims``.
         """
         x = self._as_points(x)
         if sum(orders) == 0:
@@ -389,8 +424,8 @@ class AbstractBasis(ABC):
     def sample_functions(self, weight_samples: torch.Tensor, x: torch.Tensor):
         """Map weights ``(B, C, R)`` to function values ``(B, C, N)`` at ``x``.
 
-        Standard normal weights give prior draws under the basis's approximation; the
-        mean function is added back here.
+        Computes ``w @ phi(x) + mean(x)``, so standard normal weights give draws of
+        the GP under the basis approximation.
         """
         x = self._as_points(x)
         f = weight_samples @ self.phi(x)  # (B, C, R) @ (R, N)
@@ -400,18 +435,24 @@ class AbstractBasis(ABC):
 class RFFBasis(AbstractBasis):
     """Random Fourier feature (RFF) basis for a scaled RBF kernel.
 
-    Expands ``k(x, x') ~= Phi(x)^T Phi(x')`` with ``Phi`` built from ``R/2`` random
-    frequencies drawn once at construction, so the same basis can be evaluated at any
-    points. The basis functions are sinusoids, so their derivatives are available in
-    closed form (:meth:`compute_derivative`) — the reason to prefer this over a basis
-    defined pointwise when the constraint involves derivatives.
+    Approximates ``k(x, x') ~= Phi(x)^T Phi(x')`` with sinusoids at ``R/2`` random
+    frequencies, drawn once at construction. The basis functions have closed-form
+    derivatives (:meth:`compute_derivative`), so conditions can involve derivatives
+    of the field, such as a PDE residual.
+
+    Takes the arguments of :class:`AbstractBasis`. The kernel must be a
+    ``ScaleKernel(RBFKernel)`` and ``R`` must be even.
+
+    Example:
+        >>> basis = RFFBasis(R=256, input_dim=2, mean=ZeroMean(), kernel=kernel)
+        >>> f = basis.sample_functions(torch.randn(8, 1, 256), grid)  # (8, 1, N)
     """
 
     def _get_basis_params(self):
-        """Draw the RFF frequencies. Independent of any evaluation grid.
+        """Draw the RFF frequencies.
 
-        Only the *draw* is fixed here; the lengthscale and outputscale are read off the
-        kernel (see the properties below), so they can never go stale.
+        Only the draw is fixed here; the lengthscale and outputscale are read off the
+        kernel when needed, so they track any later change to it.
         """
         assert isinstance(self.kernel, gpytorch.kernels.scale_kernel.ScaleKernel)
         assert isinstance(
@@ -420,8 +461,7 @@ class RFFBasis(AbstractBasis):
         assert self.R % 2 == 0, "RFF basis requires an even number of features R"
 
         self.D = self.input_dim
-        # gpytorch's RFFKernel owns the frequency draw; phi evaluates the features in
-        # closed form (the tests check it against gpytorch's own featurisation).
+        # gpytorch's RFFKernel draws the frequencies; phi evaluates the features itself.
         rff = ScaleKernel(
             RFFKernel(num_samples=self.R // 2, ard_num_dims=self.D, num_dims=self.D)
         )
@@ -442,7 +482,7 @@ class RFFBasis(AbstractBasis):
 
     @property
     def omega_eff(self) -> torch.Tensor:
-        """Frequencies rescaled by the lengthscale — what the derivatives bring down."""
+        """Frequencies divided by the lengthscale, ``(D, R/2)``."""
         return self.omega / self.lengthscale[:, None]  # (D, R/2)
 
     def phi(self, x: torch.Tensor) -> torch.Tensor:
@@ -458,15 +498,16 @@ class RFFBasis(AbstractBasis):
     def compute_derivative(self, x: torch.Tensor, dims, orders) -> torch.Tensor:
         """Mixed partial derivatives of the basis functions at ``x``, shape ``(R, N)``.
 
-        Each dimension in ``dims`` is differentiated to the corresponding order in
-        ``orders``.
+        Closed form, at O(R N) cost; nested autograd would materialise a Jacobian too
+        large for realistic grids.
 
-        Closed form, O(R*N): differentiating the features with nested autograd gives
-        the same values but materialises an (N, R, D, ...) Jacobian that does not fit
-        in memory at realistic grid sizes.
+        Args:
+            x: evaluation points ``(N, D)``.
+            dims: the input dimensions to differentiate along.
+            orders: the derivative order for each entry of ``dims``.
 
         Raises:
-            ValueError: If ``dims`` and ``orders`` differ in length.
+            ValueError: if ``dims`` and ``orders`` differ in length.
         """
         x = self._as_points(x)
         total = sum(orders)
@@ -480,7 +521,7 @@ class RFFBasis(AbstractBasis):
         sin_sign = 1 if total % 4 == 0 or total % 4 == 1 else -1
         sin_op = torch.sin if total % 2 == 0 else torch.cos
 
-        # each derivative brings down a factor of the (lengthscale-scaled) frequency
+        # Each derivative brings down a factor of the (lengthscale-scaled) frequency.
         prefactor = torch.ones(self.R // 2, device=self.device, dtype=self.dtype)
         for dim, order in zip(dims, orders, strict=True):
             prefactor *= self.omega_eff[dim, :] ** order
@@ -500,9 +541,8 @@ class RFFBasis(AbstractBasis):
 def _hermite(u: torch.Tensor, n: int) -> torch.Tensor:
     """Probabilists' Hermite polynomial ``He_n`` evaluated elementwise.
 
-    ``He_0 = 1``, ``He_1 = u``, ``He_{n+1}(u) = u He_n(u) - n He_{n-1}(u)``. These are
-    what derivatives of a Gaussian produce, which is why they show up when
-    differentiating an RBF kernel (see
+    ``He_0 = 1``, ``He_1 = u``, ``He_{n+1}(u) = u He_n(u) - n He_{n-1}(u)``. They
+    appear in the derivatives of a Gaussian, and hence of an RBF kernel (see
     :meth:`DecoupledRFFBasis._prior_kernel_derivative`).
     """
     if n == 0:
@@ -514,45 +554,41 @@ def _hermite(u: torch.Tensor, n: int) -> torch.Tensor:
 
 
 class DecoupledRFFBasis(AbstractBasis):
-    r"""Pathwise-conditioned RFF basis — a GP *posterior* as a finite basis.
+    r"""A GP posterior as a finite basis, by pathwise conditioning of an RFF prior.
 
-    The conditioned analogue of :class:`PosteriorKernel`. A posterior kernel cannot be
-    expanded with random Fourier features directly: RFF rests on Bochner's theorem,
-    which needs stationarity, and conditioning destroys it. Pathwise conditioning
-    (Wilson et al., *Efficiently Sampling Functions from Gaussian Process Posteriors*,
-    ICML 2020) sidesteps that by only ever approximating the **prior**, which is
-    stationary, and correcting it exactly::
+    The basis counterpart of :class:`PosteriorKernel`. Random Fourier features need a
+    stationary kernel, which a posterior is not, so :class:`RFFBasis` cannot expand
+    it directly. Pathwise conditioning (Wilson et al., *Efficiently Sampling Functions
+    from Gaussian Process Posteriors*, ICML 2020) approximates only the stationary
+    **prior** with RFF and corrects it for the data exactly::
 
         (f | y)(.) = Phi(.)^T w  +  k(., X) [K + s2 I]^-1 (y - Phi(X)^T w - eps)
                      \_ RFF prior _/     \_ exact rank-M update in the canonical basis _/
 
-    Collecting terms makes this affine in the random variables, which is what lets it
-    be a basis at all::
+    This is affine in the random variables, so collecting terms gives a basis::
 
         f = [ Phi_* - Phi_X A K_X* | -s * A K_X* ]^T [w; eps]  +  m_post
             \________________ Psi, shape (R + M, N) ________/       w, eps ~ N(0, I)
 
-    So :attr:`R` is ``num_features + M`` (M = number of training points): the ``eps``
-    block carries the observation noise and is dropped when ``noise == 0``. The mean is
-    the exact posterior mean, so :meth:`sample_functions` needs no correction.
+    So :attr:`R` is ``num_features + M``, with ``M`` the number of training points;
+    the ``eps`` block carries the observation noise and is dropped when
+    ``noise == 0``. The mean is the exact posterior mean (a :class:`PosteriorMean`).
 
-    Accuracy, on a grid extending beyond the data: the mean is exact to machine
-    precision, and the covariance tracks the true posterior far more closely than
-    conditioning the RFF model in weight space, which under-covers away from the data
-    (the "variance starvation" the paper is about).
-
-    :meth:`compute_derivative` and :meth:`mean_derivative` are both closed form, so
-    this basis can carry derivative constraints (a PDE residual, say) exactly.
+    The mean is exact, and the covariance is far closer to the true posterior than
+    conditioning the RFF weights directly, which under-estimates the variance away
+    from the data. :meth:`compute_derivative` and :meth:`mean_derivative` are both
+    closed form, so derivative conditions (a PDE residual, say) are exact too.
 
     Args:
         num_features (int): RFF features ``R_f`` for the prior. Must be even.
         input_dim (int): input dimension ``D``.
-        kernel: the *prior* kernel; must be a ``ScaleKernel(RBFKernel)`` as
-            :class:`RFFBasis` requires.
+        kernel: the *prior* kernel, a ``ScaleKernel(RBFKernel)``.
         train_x: ``(M, D)`` training inputs.
         train_y: ``(M,)`` training targets.
         noise: observation noise variance.
-        prior_mean: prior mean function; defaults to ``ZeroMean``.
+        prior_mean: prior mean function. Defaults to ``ZeroMean``.
+        device: device for the stored tensors.
+        dtype: working precision. Defaults to the kernel's dtype.
     """
 
     def __init__(
@@ -571,13 +607,13 @@ class DecoupledRFFBasis(AbstractBasis):
         self.train_x = train_x.to(device=device, dtype=dtype)
         self.train_y = train_y.to(device=device, dtype=dtype)
         self.noise = float(noise)
-        # sample_functions adds mean(x); for a posterior basis that is the posterior
-        # mean, so the deterministic part of Matheron's rule is handled there.
+        # The posterior mean is the deterministic part of the pathwise update; phi
+        # holds the random part.
         mean = PosteriorMean(kernel, self.train_x, self.train_y, noise, prior_mean)
         super().__init__(num_features, input_dim, mean, kernel, device, dtype)
 
     def _get_basis_params(self) -> None:
-        # The prior is stationary, so RFF is legitimate here — this is the whole point.
+        """Build the RFF prior basis and the solve against the training data."""
         self.num_features = self.R
         self.prior_basis = RFFBasis(
             R=self.num_features,
@@ -589,16 +625,21 @@ class DecoupledRFFBasis(AbstractBasis):
         )
         self.M = self.train_x.shape[0]
 
-        # A = [K_XX + s2 I]^-1, applied via the Cholesky factor.
+        # A = [K_XX + s2 I]^-1, kept in float64 (it inherits K_XX's conditioning) and
+        # applied via _apply_A.
         L = _train_cholesky(self.kernel, self.train_x, self.noise)
-        eye = torch.eye(self.M, dtype=self.dtype, device=self.device)
+        eye = torch.eye(self.M, dtype=torch.float64, device=self.device)
         self.register_A = torch.cholesky_solve(eye, L)  # (M, M)
         self.Phi_X = self.prior_basis.phi(self.train_x)  # (R_f, M)
 
-        # Total latent width: the eps block is degenerate when there is no noise, so
-        # it is dropped rather than diffused over to no effect.
+        # Without noise the eps block is identically zero, so it is dropped.
         self.has_noise_block = self.noise > 0.0
         self.R = self.num_features + (self.M if self.has_noise_block else 0)
+
+    def _apply_A(self, K: torch.Tensor) -> torch.Tensor:
+        """``K @ [K_XX + s2 I]^-1``, computed in float64 and returned in the basis
+        dtype."""
+        return (K.to(torch.float64) @ self.register_A).to(self.dtype)
 
     def phi(self, x: torch.Tensor) -> torch.Tensor:
         """Conditioned design matrix at ``x``, shape ``(R, N)``.
@@ -609,7 +650,7 @@ class DecoupledRFFBasis(AbstractBasis):
         x = self._as_points(x)
         Phi_x = self.prior_basis.phi(x)  # (R_f, N)
         K_xX = self.kernel(x, self.train_x).to_dense()  # (N, M)
-        W = K_xX @ self.register_A  # (N, M)
+        W = self._apply_A(K_xX)  # (N, M)
 
         blocks = [Phi_x - (W @ self.Phi_X.T).T]  # (R_f, N)
         if self.has_noise_block:
@@ -619,8 +660,8 @@ class DecoupledRFFBasis(AbstractBasis):
     def _prior_kernel_derivative(self, x: torch.Tensor, dims, orders) -> torch.Tensor:
         """``d^n/dx^n k(x, X)`` for the prior kernel, shape ``(N, M)``.
 
-        The only new quantity the conditioned basis needs: A and Phi_X are constants,
-        so every derivative of Psi is built from this block.
+        ``A`` and ``Phi_X`` are constants, so this block and the prior basis's
+        derivatives are all :meth:`compute_derivative` needs.
 
         For a scaled ARD RBF with ``u_d = (x_d - x'_d) / l_d`` the kernel is separable
         and Gaussian, so mixed partials factorise into Hermite polynomials::
@@ -629,7 +670,7 @@ class DecoupledRFFBasis(AbstractBasis):
                 = k(x, x') * prod_d (-1 / l_d)^{n_d} He_{n_d}(u_d)
 
         (``n=1`` gives ``-k u / l``; ``n=2`` gives ``k (u^2 - 1) / l^2``.) This assumes
-        a ``ScaleKernel(RBFKernel)``, which :class:`RFFBasis` already asserts.
+        a ``ScaleKernel(RBFKernel)``, which :class:`RFFBasis` checks.
         """
         ls = self.prior_basis.lengthscale  # (D,)
         diff = x[:, None, :] - self.train_x[None, :, :]  # (N, M, D)
@@ -649,19 +690,23 @@ class DecoupledRFFBasis(AbstractBasis):
 
             d Psi = [ d Phi(x) - Phi_X (d k(x, X) A)^T ;  -sigma (d k(x, X) A)^T ]
 
-        so the prior block reuses :meth:`RFFBasis.compute_derivative` and the update
-        block reuses :meth:`_prior_kernel_derivative`. Both are closed form.
+        so the prior block uses :meth:`RFFBasis.compute_derivative` and the update
+        block uses :meth:`_prior_kernel_derivative`. Both are closed form.
 
-        This is the derivative of the *basis functions* only. Samples also carry the
-        posterior mean, whose derivative is non-zero here — add
-        :meth:`mean_derivative` to get the derivative of a sampled function.
+        This is the derivative of the basis functions only; add
+        :meth:`mean_derivative` for the derivative of a sampled function.
+
+        Args:
+            x: evaluation points ``(N, D)``.
+            dims: the input dimensions to differentiate along.
+            orders: the derivative order for each entry of ``dims``.
         """
         x = self._as_points(x)
         if sum(orders) == 0:
             return self.phi(x)
 
         dPhi = self.prior_basis.compute_derivative(x, dims, orders)  # (R_f, N)
-        dW = self._prior_kernel_derivative(x, dims, orders) @ self.register_A  # (N, M)
+        dW = self._apply_A(self._prior_kernel_derivative(x, dims, orders))  # (N, M)
 
         blocks = [dPhi - (dW @ self.Phi_X.T).T]  # (R_f, N)
         if self.has_noise_block:
@@ -671,14 +716,20 @@ class DecoupledRFFBasis(AbstractBasis):
     def mean_derivative(self, x: torch.Tensor, dims, orders) -> torch.Tensor:
         """Mixed partials of the posterior mean at ``x``, shape ``(N,)``.
 
-        ``m_post = m_prior + k(x, X) alpha``, so with a constant prior mean the
-        derivative is ``d k(x, X) alpha`` — the same block :meth:`compute_derivative`
-        uses.
+        ``m_post = m_prior + k(x, X) alpha``, so with a zero prior mean the derivative
+        is ``d k(x, X) alpha``, using the same block as :meth:`compute_derivative`.
 
         A sampled function is ``w @ phi(x) + mean(x)``, so its derivative is
-        ``w @ compute_derivative(...) + mean_derivative(...)``. Forgetting the second
-        term silently drops the data-driven part of the field, which for a PDE residual
-        is usually most of it.
+        ``w @ compute_derivative(...) + mean_derivative(...)``. The second term is
+        the data-driven part of the field, often most of a PDE residual.
+
+        Args:
+            x: evaluation points ``(N, D)``.
+            dims: the input dimensions to differentiate along.
+            orders: the derivative order for each entry of ``dims``.
+
+        Raises:
+            NotImplementedError: if the prior mean is not a ``ZeroMean``.
         """
         x = self._as_points(x)
         if sum(orders) == 0:
@@ -689,4 +740,5 @@ class DecoupledRFFBasis(AbstractBasis):
                 "would contribute its own derivative term."
             )
         dK = self._prior_kernel_derivative(x, dims, orders)  # (N, M)
-        return dK @ self.mean_module.alpha  # (N,)
+        alpha = self.mean_module.alpha.to(torch.float64)  # as in PosteriorMean.forward
+        return (dK.to(torch.float64) @ alpha).to(dK.dtype)  # (N,)

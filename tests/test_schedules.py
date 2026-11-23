@@ -1,3 +1,9 @@
+"""Tests for the VP noise schedule (``flow_inference.schedules``).
+
+``LinearSchedule`` has beta(t) linear in t and alpha^2(t) = exp(-integral of beta),
+checked against the closed form and against each other via autograd.
+"""
+
 import pytest
 import torch
 
@@ -38,7 +44,7 @@ class TestLinearScheduleAlpha2:
         assert torch.is_tensor(out)
 
     def test_alpha2_near_zero_at_t1_for_strong_schedule(self, schedule):
-        # With beta_1=10 the signal is almost gone by t=1 (the schedule logs this).
+        # With beta_1 = 10 the signal is almost gone by t = 1.
         assert schedule._alpha_2(torch.tensor(1.0)) < 1e-2
 
     def test_alpha2_matches_closed_form(self, schedule):
@@ -70,7 +76,7 @@ class TestLinearScheduleBeta:
         assert (vals[1:] >= vals[:-1]).all()
 
     def test_beta_is_affine_in_t(self, schedule):
-        # β is linear: the second difference is zero.
+        # β is linear in t, so its second difference is zero.
         t = torch.linspace(0.0, 1.0, 11)
         b = schedule._beta(t)
         second_diff = b[2:] - 2 * b[1:-1] + b[:-2]

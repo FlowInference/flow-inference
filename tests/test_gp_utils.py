@@ -1,3 +1,11 @@
+"""Tests for the GP utilities (``flow_inference.gp_utils``).
+
+Covers the random-Fourier-feature bases and their closed-form derivatives, the GP
+posterior mean and kernel, and kernel hyperparameter fitting. Bases and derivatives
+are checked against autograd and independent hand-written formulas; posteriors
+against the analytic formulas and gpytorch's exact GP.
+"""
+
 import math
 
 import gpytorch
@@ -20,6 +28,7 @@ from flow_inference.gp_utils import (
 
 @pytest.fixture(autouse=True)
 def _restore_default_dtype():
+    """Run this module in float64 and restore the suite's default afterwards."""
     prev = torch.get_default_dtype()
     torch.set_default_dtype(torch.double)
     yield
@@ -57,6 +66,11 @@ def make_grid(n=7, d=2):
     for j in range(d):
         cols.append(x ** (j + 1))
     return torch.stack(cols, dim=-1)
+
+
+# ---------------------------------------------------------------------------
+# RFFBasis
+# ---------------------------------------------------------------------------
 
 
 def test_rff_basis_shapes_scalar_lengthscale():
@@ -257,8 +271,8 @@ def test_compute_derivative_matches_independent_formula(dims, orders):
     grid = make_grid(n=7, d=2)
     mean = gpytorch.means.ZeroMean()
 
-    # Use non-unit lengthscales to catch missing lengthscale factors.
-    # Use D != R/2 to catch wrong normalization by sqrt(D).
+    # Non-unit lengthscales catch missing lengthscale factors, and D != R/2 catches
+    # normalising by sqrt(D) instead of sqrt(R/2).
     kernel = make_kernel(lengthscale=torch.tensor([0.6, 1.7]), outputscale=2.5)
 
     basis = RFFBasis(
@@ -353,9 +367,11 @@ def test_mixed_derivative_matches_autograd():
 
 
 # ---------------------------------------------------------------------------
-# PosteriorKernel — the GP posterior covariance as a callable kernel.
-# gpytorch has no such object; the posterior is otherwise only reachable as a
-# MultivariateNormal over a fixed set of points.
+# PosteriorKernel
+#
+# The GP posterior covariance as a callable kernel. gpytorch has no such object;
+# the posterior is otherwise only reachable as a MultivariateNormal over a fixed set
+# of points.
 # ---------------------------------------------------------------------------
 
 
@@ -434,8 +450,8 @@ class TestPosteriorKernel:
         assert pk(far, far, diag=True).item() > 0.5
 
     def test_is_not_stationary(self):
-        # Flagged because RFFBasis (Bochner) requires stationarity and so cannot be
-        # applied to this kernel.
+        # Flagged because RFFBasis (via Bochner's theorem) needs a stationary kernel,
+        # so it cannot be applied to this one.
         kernel, train_x, noise = _post_setup()
         pk = PosteriorKernel(kernel, train_x, noise)
         lag = 0.1
@@ -458,8 +474,10 @@ class TestPosteriorKernel:
 
 
 # ---------------------------------------------------------------------------
-# fit_kernel_hyperparameters — type-II ML for the kernel only. Conditioning is a
-# separate step (gp_posterior), so this returns the fitted kernel, not a posterior.
+# fit_kernel_hyperparameters
+#
+# Type-II maximum likelihood for the kernel only. Conditioning is a separate step
+# (gp_posterior), so this returns the fitted kernel, not a posterior.
 # ---------------------------------------------------------------------------
 
 
@@ -510,6 +528,11 @@ class TestFitKernelHyperparameters:
         grid = torch.linspace(0, 1, 9, dtype=torch.float64).unsqueeze(-1)
         assert mean(grid).shape == (9,)
         assert kern(grid, grid).to_dense().shape == (9, 9)
+
+
+# ---------------------------------------------------------------------------
+# PosteriorMean and gp_posterior
+# ---------------------------------------------------------------------------
 
 
 class TestPosteriorMean:
@@ -613,7 +636,7 @@ class TestGPPosteriorHelper:
 
 
 # ---------------------------------------------------------------------------
-# AbstractBasis: the contract every basis implementation must satisfy.
+# AbstractBasis: the contract every basis implementation must satisfy
 # ---------------------------------------------------------------------------
 
 BASIS_GRID_N = 60
@@ -671,9 +694,11 @@ class TestAbstractBasisContract:
 
 
 # ---------------------------------------------------------------------------
-# DecoupledRFFBasis — a GP posterior as a finite basis, via pathwise conditioning
-# (Wilson et al. 2020). The posterior kernel is non-stationary so it cannot be
-# RFF'd directly; this expands only the (stationary) prior and corrects exactly.
+# DecoupledRFFBasis
+#
+# A GP posterior as a finite basis, via pathwise conditioning (Wilson et al. 2020).
+# The posterior kernel is non-stationary, so it has no RFF expansion of its own;
+# this expands only the (stationary) prior and corrects exactly.
 # ---------------------------------------------------------------------------
 
 DEC_M, DEC_N, DEC_RF, DEC_NOISE = 10, 40, 512, 1e-3
@@ -683,7 +708,7 @@ def _decoupled_setup(num_features=DEC_RF, noise=DEC_NOISE):
     torch.manual_seed(0)
     train_x = torch.rand(DEC_M, 1, dtype=torch.float64)
     train_y = torch.sin(6 * train_x.squeeze(-1))
-    # grid deliberately extends beyond the data, where variance starvation shows
+    # The grid extends beyond the data, where variance starvation shows.
     grid = torch.linspace(-0.2, 1.2, DEC_N, dtype=torch.float64).unsqueeze(-1)
     kernel = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel()).double()
     kernel.base_kernel.lengthscale = 0.15
@@ -727,9 +752,8 @@ class TestDecoupledRFFBasis:
         assert torch.allclose(basis.mean(grid), mean_ref(grid), atol=1e-10)
 
     def test_mean_coerces_foreign_dtype(self):
-        # basis.mean is a method, not the bare gpytorch module, so it coerces its
-        # argument like phi does. Called on the module, a float32 grid against a
-        # float64 posterior raises inside gpytorch instead of promoting.
+        # basis.mean coerces its argument like phi does; a float32 grid passed
+        # straight to a float64 gpytorch mean would raise rather than promote.
         basis, _, _, _, grid = _decoupled_setup()
         out = basis.mean(grid.to(torch.float32))
         assert out.dtype == basis.dtype
@@ -742,7 +766,7 @@ class TestDecoupledRFFBasis:
         assert err.max() < 0.1
 
     def test_beats_naive_weight_space_conditioning(self):
-        # The point of the method: conditioning the RFF *model* in weight space
+        # The point of the method: conditioning the RFF model in weight space
         # under-covers away from the data (variance starvation).
         basis, kernel, train_x, train_y, grid = _decoupled_setup()
         _, k_post = gp_posterior(kernel, train_x, train_y, noise=DEC_NOISE)
@@ -779,8 +803,8 @@ class TestDecoupledRFFBasis:
         assert basis.mean_derivative(grid, (0,), (2,)).shape == (DEC_N,)
 
     def test_mean_derivative_rejects_a_non_zero_prior_mean(self):
-        # A constant/parametric prior mean would contribute its own derivative term,
-        # which is not implemented — fail loudly rather than silently drop it.
+        # A non-zero prior mean would contribute its own derivative term, which is
+        # not implemented, so it raises rather than silently dropping it.
         torch.manual_seed(0)
         train_x = torch.rand(DEC_M, 1, dtype=torch.float64)
         kernel = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel()).double()
@@ -901,7 +925,7 @@ class TestDecoupledRFFBasisDerivatives:
 
     def test_sampled_function_derivative_needs_the_mean_term(self):
         # A sampled function is w @ phi + mean, so both terms differentiate. Dropping
-        # the mean term is a silent, large error — this pins that it is required.
+        # the mean term is a large error.
         basis, _, _, pts = self._setup()
         torch.manual_seed(1)
         w = torch.randn(3, 1, basis.R, dtype=torch.float64)
@@ -918,9 +942,7 @@ class TestDecoupledRFFBasisDerivatives:
         assert torch.allclose(
             d_basis + basis.mean_derivative(pts, dims, orders), ref.T, atol=1e-9
         )
-        assert not torch.allclose(
-            d_basis, ref.T, atol=1e-3
-        )  # mean term is not optional
+        assert not torch.allclose(d_basis, ref.T, atol=1e-3)
 
     def test_noiseless_basis_has_derivatives_too(self):
         basis, _, _, pts = self._setup(noise=0.0)

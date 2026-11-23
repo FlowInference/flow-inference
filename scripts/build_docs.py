@@ -2,9 +2,9 @@
 
 Notebooks are committed with their outputs stripped, so the rendered site is built
 from freshly executed copies. Each notebook runs top to bottom at full budget (use a
-GPU), from its own directory so relative data paths and ``plotting.py`` resolve,
-and the executed copy is written under ``build/docs/`` — gitignored, so outputs
-never reach the main branch. The README becomes the site's home page.
+GPU), from its own directory so that relative data paths and ``plotting.py``
+resolve. The executed copy is written under ``build/docs/``, which is gitignored,
+so outputs never reach the main branch. The README becomes the site's home page.
 
     python scripts/build_docs.py                 # execute new/changed notebooks
     python scripts/build_docs.py --rerun         # execute every notebook
@@ -32,6 +32,7 @@ REPO_URL = "https://github.com/FlowInference/flow-inference/blob/main/"
 
 
 def execute(source: Path, target: Path) -> None:
+    """Run the notebook ``source`` from its own directory and save it to ``target``."""
     nb = nbformat.read(source, as_version=4)
     nbclient.NotebookClient(
         nb,
@@ -44,8 +45,9 @@ def execute(source: Path, target: Path) -> None:
 
 
 def write_index() -> None:
-    # Links into examples/*.ipynb resolve to the rendered pages; everything else
-    # in the README (LICENSE, CITATION.cff, examples/) points back to GitHub.
+    """Stage the README, and the assets it uses, as the site's home page."""
+    # Links to examples/*.ipynb resolve to the rendered pages; every other relative
+    # link in the README (LICENSE, CITATION.cff, examples/) points back to GitHub.
     readme = (ROOT / "README.md").read_text()
     readme = re.sub(
         r"\]\((?!https?://|#)([^)]+?)(?<!\.ipynb)\)",
@@ -62,6 +64,7 @@ def write_index() -> None:
 
 
 def main() -> None:
+    """Execute the requested notebooks (default: all) and stage the site."""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("notebooks", nargs="*", type=Path, help="default: all")
     parser.add_argument("--rerun", action="store_true", help="ignore cached copies")

@@ -1,3 +1,5 @@
+"""Shared fixtures: small flows, maps and conditions that keep the suite fast."""
+
 import gpytorch
 import pytest
 import torch
@@ -11,32 +13,17 @@ from flow_inference.flows import (
     NeuralFlow,
 )
 from flow_inference.maps import StudentTProcessMap
-from flow_inference.schedules import LinearSchedule
 from flow_inference.training_samplers import TrainingSampler
 
-# The package defaults to float64 (see BaseFlow/BaseMap), so the tests run under the
-# same ambient default the notebooks use. Without it every torch.randn(...) in a test
-# is float32 and collides with the float64 buffers on the flows and maps.
-torch.set_default_dtype(torch.float64)
+# The package works in float32 (only its kernel-matrix setup is float64), so the tests
+# run under the same default dtype as the notebooks.
+torch.set_default_dtype(torch.float32)
 
-N = 8  # spatial points — small enough to keep tests fast
+N = 8  # spatial points
 
-# NeuralFlow operates on a square H×W grid; keep it tiny so the U-Net / training
-# loop run in milliseconds.
+# NeuralFlow works on a square H×W grid; a tiny one keeps the network and training
+# loop to milliseconds.
 NF_H = NF_W = 4
-
-
-# ---------------------------------------------------------------------------
-# Schedules
-# ---------------------------------------------------------------------------
-
-
-@pytest.fixture
-def linear_schedule():
-    return LinearSchedule(
-        beta_0=torch.tensor(0.0001),
-        beta_1=torch.tensor(10.0),
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -45,12 +32,11 @@ def linear_schedule():
 
 
 class IdentityKernel(gpytorch.kernels.Kernel):
-    """k(x, x') = delta(x, x') — the identity Gram matrix on any grid.
+    """k(x, x') = delta(x, x'): the identity Gram matrix on any grid.
 
-    GaussianProcessFlow builds from a kernel, and no standard kernel gives exactly the
-    identity on distinct points. Many tests want an identity covariance so that the
-    whitened and data spaces coincide, which makes L and the data-space map trivial to
-    assert against.
+    No standard kernel gives exactly the identity on distinct points. Many tests want
+    an identity covariance so that the whitened and data spaces coincide, which makes
+    L and the data-space map trivial to assert against.
     """
 
     is_stationary = False
@@ -73,8 +59,7 @@ def gp_flow():
 def gp_flow_correlated():
     """Single-channel GP flow whose covariance has off-diagonal structure.
 
-    An RBF with lengthscale sqrt(0.05) reproduces the exp(-d^2 / 0.1) matrix these
-    tests were originally written against.
+    An RBF with lengthscale sqrt(0.05), so K_ij = exp(-(x_i - x_j)^2 / 0.1).
     """
     kernel = gpytorch.kernels.RBFKernel()
     kernel.lengthscale = 0.05**0.5
@@ -107,15 +92,15 @@ def increment_flow():
 
 
 class TinyVectorField(nn.Module):
-    """Minimal stand-in for the notebook U-Net: a single time-conditioned conv on
-    the (B, 1, H, W) image. Enough to exercise every NeuralFlow code path (reshape
-    in/out, scalar vs per-sample t, gradient flow in ``fit``) without the cost of a
-    real U-Net. ``t`` may be a scalar-broadcastable or a (B,) tensor."""
+    """Minimal stand-in for the notebook U-Net: one time-conditioned conv on the
+    (B, 1, H, W) image. Enough to exercise every NeuralFlow code path (reshape in and
+    out, scalar vs per-sample t, gradients in ``fit``) without the cost of a real
+    network. ``t`` may be a scalar or a (B,) tensor."""
 
     def __init__(self, H, W):
         super().__init__()
         self.H, self.W = H, W
-        # float32, like a real learned velocity field — NeuralFlow warns otherwise.
+        # float32, like a real learned velocity field; NeuralFlow warns otherwise.
         self.conv = nn.Conv2d(1, 1, 3, padding=1).float()
 
     def forward(self, x, t):
@@ -136,11 +121,7 @@ def neural_flow(tiny_vector_field):
 
 @pytest.fixture
 def training_sampler():
-    """TrainingSampler over a small grid map matching the NeuralFlow grid.
-
-    ``buffer_size`` must divide ``num_samples`` and be ≤ it, else the precompute
-    loop (range(num_samples // buffer_size)) runs zero times and leaves no samples.
-    """
+    """TrainingSampler over a small grid map matching the NeuralFlow grid."""
     return TrainingSampler(num_samples=12, map=_small_map(NF_H, NF_W), buffer_size=6)
 
 
@@ -163,20 +144,3 @@ class PositivityCondition(BinaryCondition):
 
     def smooth_eval_condition(self, x: torch.Tensor) -> torch.Tensor:
         return x
-
-
-@pytest.fixture
-def positivity_condition():
-    return PositivityCondition(v=0.1)
-
-
-# ---------------------------------------------------------------------------
-# Kernels / maps
-# ---------------------------------------------------------------------------
-
-
-@pytest.fixture
-def rbf_kernel():
-    k = gpytorch.kernels.RBFKernel()
-    k.lengthscale = 0.25
-    return k
