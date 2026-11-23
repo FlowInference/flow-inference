@@ -56,6 +56,12 @@ def _fixed_steps(arguments):
     if arguments.get("adaptive"):
         arguments["adaptive"] = False
         arguments["num_steps"] = 10
+        # Expose the substituted fixed solve's counts to notebooks that report
+        # adaptive trial statistics. The final denoise replaces the last step.
+        arguments["self"].adaptive_stats = {
+            "accepted": arguments["num_steps"] - int(arguments["final_denoise"]),
+            "rejected": 0,
+        }
 
 
 _cap(_sampler.IntegratorSampler, "sample", adjust=_fixed_steps, num_steps=10)
