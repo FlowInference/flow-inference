@@ -1,10 +1,10 @@
-"""Tests for the latent→data-space maps.
+"""Tests for the latent-to-data-space maps (``flow_inference.maps``).
 
-Every map takes ``(B, latent_dim)`` (or ``(B, 1, latent_dim)``) iid standard
-Gaussians and returns a ``(B, 1, output_dim)`` field. The shared contracts —
-output shape, finiteness, channel axis, latent-flattening, and (where the map is
-smooth) end-to-end differentiability for gradient guidance — are exercised here,
-plus a marginal/structural check specific to each map.
+Every map takes ``(B, latent_dim)`` (or ``(B, C, latent_dim)``) iid standard
+Gaussians and returns a ``(B, C, output_dim)`` field. The shared contracts (output
+shape, finiteness, channel axis, batch independence and, where the map is smooth,
+differentiability for gradient guidance) are checked for every map, plus a marginal
+or structural check specific to each.
 """
 
 import gpytorch
@@ -26,13 +26,13 @@ B = 4
 
 
 # ---------------------------------------------------------------------------
-# Base-class dimension model (the latent_dim / output_shape / channels contract)
+# BaseMap dimensions: latent_dim, output_shape and channels
 # ---------------------------------------------------------------------------
 
 
 class _PathMap(BaseMap):
     """A non-grid map: an Euler-Maruyama scalar SDE path. latent_dim == output_dim,
-    and output_shape is 1D — there is no H×W grid."""
+    and output_shape is 1D, with no H×W grid."""
 
     def __init__(self, num_times):
         super().__init__(latent_dim=num_times, output_shape=(num_times,))
@@ -56,7 +56,7 @@ class _CoupledMap(BaseMap):
         self.n = n
 
     def _map(self, z):
-        # couple the channels: output channel 0 depends on both inputs
+        # Each output channel depends on both input channels.
         x = z[:, 0] + z[:, 1]
         y = z[:, 0] - z[:, 1]
         return torch.stack([x, y], dim=1)  # (B, 2, n)
@@ -88,7 +88,6 @@ class TestDimensionModel:
         z = torch.randn(B, 2, 4)
         out = m(z)
         assert out.shape == (B, 2, 4)
-        # channel coupling: out[:,0] = z[:,0]+z[:,1], out[:,1] = z[:,0]-z[:,1]
         assert torch.allclose(out[:, 0], z[:, 0] + z[:, 1])
         assert torch.allclose(out[:, 1], z[:, 0] - z[:, 1])
 
@@ -108,9 +107,9 @@ def kernel():
     return k
 
 
-# Builders so each map can be parametrised uniformly. ``differentiable`` flags
-# maps that are smooth in *all* latents (so a dense gradient is expected); the
-# hard-max / hard-pick maps only receive a sparse subgradient.
+# Builders so each map can be parametrised uniformly. ``differentiable`` flags maps
+# that are smooth in all latents (so a dense gradient is expected); the hard-max map
+# only receives a sparse subgradient.
 def _builders(kernel):
     return {
         "cauchy": (lambda: CauchyConvolutionMap(H, W, kernel), True),
@@ -154,8 +153,8 @@ class TestMapContracts:
 
     @pytest.mark.parametrize("name", ALL_MAPS)
     def test_multichannel_maps_each_channel_independently(self, kernel, name):
-        # Every map here is a field map: the channel axis rides along, so channel c of
-        # a (B, 3, ·) call equals a single-channel call on that slice.
+        # Every map here acts on each channel independently, so channel c of a
+        # (B, 3, ·) call equals a single-channel call on that slice.
         m = _builders(kernel)[name][0]()
         torch.manual_seed(0)
         z = torch.randn(B, 3, m.latent_dim)
@@ -177,7 +176,7 @@ class TestMapContracts:
     @pytest.mark.parametrize("name", ALL_MAPS)
     def test_gradient_flows(self, kernel, name):
         # Guidance back-props through the map; the gradient must at least be finite
-        # and non-trivial (dense for smooth maps, sparse for the hard-pick ones).
+        # and non-trivial (dense for smooth maps, sparse for the hard-max one).
         builder, differentiable = _builders(kernel)[name]
         m = builder()
         z = torch.randn(B, m.latent_dim, requires_grad=True)
@@ -221,7 +220,7 @@ class TestBrownResnickMap:
         assert m.L == 7
 
     def test_more_storms_better_max_stable_approx(self, kernel):
-        # Both run; sanity that storm count only changes latent size, not shape.
+        # Smoke check: the storm count changes the latent size, not the output shape.
         m = BrownResnickMap(H, W, kernel, num_storms=32)
         out = m(torch.randn(2, m.latent_dim))
         assert out.shape == (2, 1, GRID)
@@ -234,47 +233,13 @@ class TestStudentTProcessMap:
         assert m.nu == 5
 
     def test_heavier_tails_than_gaussian(self, kernel):
-        # t_4 marginals have excess kurtosis → fatter tails than the Cauchy-PIT map.
+        # t_4 marginals have excess kurtosis, so fatter tails than a Gaussian.
         torch.manual_seed(0)
         m = StudentTProcessMap(H, W, kernel, nu=4)
         out = m(torch.randn(20000, m.latent_dim)).squeeze(1)
-        # kurtosis well above the Gaussian value of 3
         centered = out - out.mean()
         kurt = (centered**4).mean() / (centered.var() ** 2)
-        assert kurt > 3.5
-
-
-# ---------------------------------------------------------------------------
-# Marginal normalisation: the heavy-tail maps divide the GP draw by its pointwise
-# std sqrt(diag(K)), so their marginals must not depend on the kernel outputscale.
-# A ScaleKernel is the common gpytorch idiom that makes diag(K) != 1 and would
-# otherwise silently rescale the marginals.
-# ---------------------------------------------------------------------------
-
-
-def _scaled_rbf(outputscale):
-    k = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel())
-    k.base_kernel.lengthscale = 0.25
-    k.outputscale = outputscale
-    return k
-
-
-@pytest.mark.parametrize(
-    "build, theory_var",
-    [
-        # t_nu(0, 1) marginals: var = nu / (nu - 2)
-        (lambda k: StudentTProcessMap(H, W, k, nu=6), 6 / (6 - 2)),
-        # NIG(alpha, 0, 0, delta) marginals: var = delta * alpha^2 / gamma^3, gamma = alpha
-        (lambda k: LevyNIGMap(H, W, k, alpha=2.0, beta=0.0, delta=1.0, mu=0.0), 0.5),
-    ],
-    ids=["student_t", "levy_nig"],
-)
-@pytest.mark.parametrize("outputscale", [0.25, 1.0, 3.0])
-def test_marginals_invariant_to_outputscale(build, theory_var, outputscale):
-    torch.manual_seed(0)
-    m = build(_scaled_rbf(outputscale))
-    out = m(torch.randn(40000, m.latent_dim, dtype=m.dtype)).squeeze(1)
-    assert out.var().item() == pytest.approx(theory_var, rel=0.1)
+        assert kurt > 3.5  # the Gaussian value is 3
 
 
 class TestLogGaussianCoxMap:
@@ -307,6 +272,45 @@ class TestLevyNIGMap:
         centered = out - out.mean()
         skew = (centered**3).mean() / (centered.var() ** 1.5 + 1e-8)
         assert skew > 0.1  # right-skew from positive beta
+
+
+# ---------------------------------------------------------------------------
+# Marginal normalisation
+#
+# The heavy-tailed maps divide the GP draw by its pointwise std sqrt(diag(K)), so
+# their marginals must not depend on the kernel outputscale. A ScaleKernel, the
+# usual gpytorch idiom, makes diag(K) != 1.
+# ---------------------------------------------------------------------------
+
+
+def _scaled_rbf(outputscale):
+    k = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel())
+    k.base_kernel.lengthscale = 0.25
+    k.outputscale = outputscale
+    return k
+
+
+@pytest.mark.parametrize(
+    "build, theory_var",
+    [
+        # t_nu(0, 1) marginals: var = nu / (nu - 2)
+        (lambda k: StudentTProcessMap(H, W, k, nu=6), 6 / (6 - 2)),
+        # NIG(alpha, 0, 0, delta) marginals: var = delta * alpha^2 / gamma^3, gamma = alpha
+        (lambda k: LevyNIGMap(H, W, k, alpha=2.0, beta=0.0, delta=1.0, mu=0.0), 0.5),
+    ],
+    ids=["student_t", "levy_nig"],
+)
+@pytest.mark.parametrize("outputscale", [0.25, 1.0, 3.0])
+def test_marginals_invariant_to_outputscale(build, theory_var, outputscale):
+    torch.manual_seed(0)
+    m = build(_scaled_rbf(outputscale))
+    out = m(torch.randn(40000, m.latent_dim, dtype=m.dtype)).squeeze(1)
+    assert out.var().item() == pytest.approx(theory_var, rel=0.1)
+
+
+# ---------------------------------------------------------------------------
+# Device and dtype tracking
+# ---------------------------------------------------------------------------
 
 
 class TestMapDeviceDtypeTracking:

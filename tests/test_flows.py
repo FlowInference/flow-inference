@@ -1,8 +1,9 @@
-"""Tests for the flow classes (GaussianFlow, GaussianProcessFlow, GaussianIncrementFlow).
+"""Tests for the flows (``flow_inference.flows``).
 
-The flows are the unconditional generative backbone: a VP-noise process whose
-unconditional drift is zero (the prior is already N(0, I) in the working space),
-plus a ``_to_data_space`` map and a Tweedie terminal predictor used by guidance.
+The flows are the unconditional generative backbone: a VP noising process whose
+drift is zero for the Gaussian flows (the prior is already N(0, I) in the working
+space) or learned for ``NeuralFlow``, plus a ``_to_data_space`` map and a Tweedie
+terminal predictor used by guidance.
 """
 
 import warnings
@@ -12,16 +13,21 @@ import pytest
 import torch
 
 from flow_inference.conditions import EqualityCondition
+from flow_inference.flow_utils import build_grid_in_box
 from flow_inference.flows import (
     BasisGaussianProcessFlow,
     GaussianFlow,
     GaussianIncrementFlow,
     GaussianProcessFlow,
     NeuralFlow,
+    _whiten_factors,
 )
+from flow_inference.gp_utils import RFFBasis, gp_posterior
+from flow_inference.guidance import GuidanceMC
 from flow_inference.maps import BaseMap
+from flow_inference.sampler import IntegratorSampler
 from flow_inference.training_samplers import TrainingSampler
-from tests.conftest import NF_H, NF_W, TinyVectorField
+from tests.conftest import NF_H, NF_W, TEST_GRID, IdentityKernel, TinyVectorField
 
 N = 8
 C = 1
@@ -31,8 +37,8 @@ B = 4
 def _flow_from_matrix(covar):
     """GP flow for a hand-built covariance, via a kernel that returns it verbatim.
 
-    GaussianProcessFlow takes a kernel now; a couple of tests need a specific
-    (possibly rank-deficient) matrix rather than one a real kernel would produce.
+    For tests that need a specific (possibly rank-deficient) matrix rather than one a
+    real kernel would produce.
     """
 
     class _Fixed(gpytorch.kernels.Kernel):
@@ -86,7 +92,7 @@ class TestGaussianFlow:
         large_t = gaussian_flow.predict_terminal(x, torch.tensor(0.9))
         assert large_t.abs().mean() < small_t.abs().mean()
 
-    # --- sample_terminal (closed-form posterior, GP-specific extra) ---
+    # --- sample_terminal (closed-form posterior draws) ---
 
     def test_sample_terminal_shape(self, gaussian_flow):
         x = torch.randn(B, C, N)
@@ -95,8 +101,8 @@ class TestGaussianFlow:
 
     def test_sample_terminal_reuses_frozen_noise(self, gaussian_flow):
         # The reparameterisation noise is frozen (cached on the flow) across calls
-        # at the same batch/sample count, so gradients through guidance flow
-        # through mu only.
+        # with the same batch and sample counts, so gradients through guidance flow
+        # through the mean only.
         x = torch.randn(B, C, N)
         samples_first = gaussian_flow.sample_terminal(
             x, torch.tensor(0.5), num_samples=5
@@ -129,10 +135,11 @@ class TestGaussianFlow:
 
 class TestGaussianProcessFlow:
     def test_buffers_registered(self, gp_flow):
-        # The covariance is not stored directly — only its whitening factor L (and
-        # inverse) plus the mean. K is recoverable as L Lᵀ (see test below).
-        for name in ("target_mean", "L", "L_inv"):
+        # Only the whitening factor L and the mean are stored; K is recovered as L Lᵀ
+        # (see below), and no inverse factor is kept.
+        for name in ("target_mean", "L"):
             assert hasattr(gp_flow, name)
+        assert not hasattr(gp_flow, "L_inv")
 
     def test_dims_single_channel(self, gp_flow):
         assert gp_flow.channels == 1 and gp_flow.latent_dim == N
@@ -142,14 +149,9 @@ class TestGaussianProcessFlow:
         assert gp_flow.L.shape == (1, N, N)
         assert gp_flow.target_mean.shape == (1, N)
 
-    def test_L_times_L_inv_is_identity(self, gp_flow):
-        product = torch.bmm(gp_flow.L, gp_flow.L_inv)
-        eye = torch.eye(N).unsqueeze(0).expand_as(product)
-        assert torch.allclose(product, eye, atol=1e-5)
-
     def test_L_recovers_covariance(self, gp_flow_correlated):
-        # L Lᵀ == K, the defining property of the whitening factor. The covariance
-        # is no longer stored, so rebuild the reference from the fixture's definition.
+        # L Lᵀ == K, the defining property of the whitening factor, with K rebuilt
+        # from the fixture's kernel.
         base = torch.linspace(0, 1, N)
         K_ref = torch.exp(-((base[:, None] - base[None, :]) ** 2) / 0.1)
         K = torch.bmm(gp_flow_correlated.L, gp_flow_correlated.L.transpose(-2, -1))
@@ -165,8 +167,6 @@ class TestGaussianProcessFlow:
         assert torch.allclose(gp_flow._to_data_space(z), z, atol=1e-5)
 
     def test_to_data_space_adds_mean(self):
-        from tests.conftest import TEST_GRID, IdentityKernel
-
         const = gpytorch.means.ConstantMean()
         with torch.no_grad():
             const.constant.fill_(3.0)
@@ -177,8 +177,7 @@ class TestGaussianProcessFlow:
         )
 
     def test_to_data_space_produces_correct_covariance(self, gp_flow_correlated):
-        # Whitened N(0,I) samples mapped through L should have covariance ≈ K. With
-        # the covariance buffer gone, the reference is L Lᵀ (its defining identity).
+        # Whitened N(0, I) samples mapped through L should have covariance L Lᵀ = K.
         torch.manual_seed(0)
         z = torch.randn(20000, 1, N)
         f = gp_flow_correlated._to_data_space(z).squeeze(1)  # (S, N)
@@ -196,7 +195,7 @@ class TestGaussianProcessFlow:
         # A rank-deficient covariance must still decompose thanks to the jitter clamp.
         rank1 = torch.ones(N, N)
         flow = _flow_from_matrix(rank1)
-        assert torch.isfinite(flow.L).all() and torch.isfinite(flow.L_inv).all()
+        assert torch.isfinite(flow.L).all()
 
 
 # ---------------------------------------------------------------------------
@@ -237,7 +236,7 @@ class TestGaussianProcessFlowMultiChannel:
         k1, k2 = _rbf(0.1), _rbf(0.5, outputscale=2.0)
         flow = GaussianProcessFlow([k1, k2], [_const(0.0), _const(0.0)], self._grid())
         assert flow.channels == 2 and flow.latent_dim == N  # latent_dim is per channel
-        assert flow.L.shape == (2, N, N) and flow.L_inv.shape == (2, N, N)
+        assert flow.L.shape == (2, N, N)
         for c, k in enumerate((k1, k2)):
             LLt = flow.L[c] @ flow.L[c].T
             assert torch.allclose(LLt, self._gram(k), atol=1e-6)
@@ -292,8 +291,6 @@ class TestGaussianProcessFlowMultiChannel:
         assert not torch.allclose(x[:, 0], torch.zeros(B, N))
 
     def test_samples_have_each_channels_covariance(self):
-        from flow_inference.sampler import IntegratorSampler
-
         k1, k2 = _rbf(0.1), _rbf(0.5, outputscale=2.0)
         flow = GaussianProcessFlow([k1, k2], [_const(0.0), _const(1.0)], self._grid())
         torch.manual_seed(0)
@@ -355,14 +352,14 @@ class TestNeuralFlow:
         assert neural_flow.device == param.device
 
     def test_float32_network_does_not_warn(self, tiny_vector_field):
-        # The intended pairing: float64 everywhere else, float32 for the network.
+        # A float32 network is the expected case.
         with warnings.catch_warnings():
             warnings.simplefilter("error")
             NeuralFlow(H=NF_H, W=NF_W, neural_network=tiny_vector_field)
 
     def test_float64_network_warns(self):
         # A double-precision velocity field costs several times the compute and buys
-        # nothing, so it is worth flagging rather than silently accepting.
+        # nothing, so it is flagged.
         net = TinyVectorField(NF_H, NF_W).double()
         with pytest.warns(UserWarning, match="float64"):
             NeuralFlow(H=NF_H, W=NF_W, neural_network=net)
@@ -386,7 +383,7 @@ class TestNeuralFlow:
         assert neural_flow(x, t).shape == (B, C, neural_flow.latent_dim)
 
     def test_call_is_no_grad(self, neural_flow):
-        # __call__ wraps the network in no_grad — the velocity is a leaf w.r.t. autograd.
+        # __call__ runs the network under no_grad, so the velocity carries no graph.
         x = torch.randn(B, C, neural_flow.latent_dim, dtype=neural_flow.dtype)
         assert not neural_flow(x, 0.5).requires_grad
 
@@ -413,9 +410,8 @@ class TestNeuralFlow:
 
     def test_predict_terminal_inverts_velocity_at_zero_field(self, neural_flow):
         # With v == 0 the Tweedie algebra collapses to x_data = x_t / sqrt(α_t)
-        # plus the noise recovered from -x_t. We just assert it is well-defined and
-        # finite across a sweep of t (the denoiser is exercised end-to-end in the
-        # sampler tests).
+        # plus the noise recovered from -x_t. Here we only check it is finite across
+        # a sweep of t; the sampler tests exercise the denoiser end to end.
         x = torch.randn(B, C, neural_flow.latent_dim, dtype=neural_flow.dtype)
         for t in (0.1, 0.5, 0.9):
             assert torch.isfinite(neural_flow.predict_terminal(x, t)).all()
@@ -441,7 +437,7 @@ class TestNeuralFlow:
         )
 
     def test_fit_rejects_mismatched_grid(self, tiny_vector_field, make_map):
-        # Sampler grid must match the flow grid.
+        # The training sampler's grid must match the flow's.
         flow = NeuralFlow(H=4, W=4, neural_network=tiny_vector_field)
         sampler = TrainingSampler(num_samples=12, map=make_map(3, 3), buffer_size=6)
         with pytest.raises(AssertionError, match="grid size"):
@@ -449,16 +445,15 @@ class TestNeuralFlow:
 
 
 # ---------------------------------------------------------------------------
-# output_shape / to_display — the natural display reshape applied to samples
+# output_shape / to_display
 # ---------------------------------------------------------------------------
 
 
 class TestDisplayShape:
     """``flow.output_shape`` is the per-channel shape of a returned sample, and
     ``flow.to_display`` reshapes the flat ``(B, C, output_dim)`` field to
-    ``(B, C, *output_shape)`` so callers can plot without a manual ``.view``. The
-    diffusion and conditions still work on the flat field — only the final sample
-    is reshaped (see the sampler)."""
+    ``(B, C, *output_shape)`` so callers can plot it directly. The diffusion and
+    conditions work on the flat field; only the final sample is reshaped."""
 
     def test_gp_flow_shape_is_1d(self, gp_flow):
         # A GP flow is a 1D field: output_shape == (N,), so to_display is a no-op.
@@ -472,7 +467,7 @@ class TestDisplayShape:
         f = torch.randn(B, 1, increment_flow.output_dim)
         d = increment_flow.to_display(f)
         assert d.shape == (B, 1, 3, 3)
-        # row-major reshape: flattening the display recovers the flat field
+        # Row-major: flattening the display recovers the flat field.
         assert torch.equal(d.reshape(B, 1, -1), f)
 
     def test_neural_flow_grid_shape(self, neural_flow):
@@ -482,7 +477,7 @@ class TestDisplayShape:
 
     def test_coupled_path_flow_stays_flat(self):
         # A coupled, non-grid map (e.g. a 2D SDE path) keeps its (output_dim,) shape
-        # and channel axis — to_display must NOT collapse or grid-ify the channels.
+        # and channel axis: to_display must not collapse or grid the channels.
         class _Coupled2DPath(BaseMap):
             def __init__(self, n):
                 super().__init__(latent_dim=n, output_shape=(n,), channels=2)
@@ -497,17 +492,16 @@ class TestDisplayShape:
 
 
 # ---------------------------------------------------------------------------
-# device / dtype follow .to() — these are properties derived from an empty
-# buffer, not attributes snapshotted at construction. Holding them as plain
-# attributes meant every tensor the sampler allocated from them (latents, time
-# grid, SDE noise) landed on the pre-move device and sampling raised.
+# Device and dtype tracking
 # ---------------------------------------------------------------------------
 
 
 class TestDeviceDtypeTracking:
-    def _flow(self):
-        from tests.conftest import TEST_GRID, IdentityKernel
+    """``device`` and ``dtype`` are read from an empty buffer, so they follow
+    ``.to()``/``.double()`` and everything the sampler allocates from them (latents,
+    time grid, SDE noise) lands on the flow's current device."""
 
+    def _flow(self):
         return GaussianProcessFlow(
             IdentityKernel(), gpytorch.means.ZeroMean(), TEST_GRID
         )
@@ -521,22 +515,18 @@ class TestDeviceDtypeTracking:
         assert f.dtype == f.L.dtype == torch.float32
 
     def test_sample_after_double(self):
-        from flow_inference.sampler import IntegratorSampler
-
         f = self._flow().double()
         out = IntegratorSampler(f).sample(num_samples=2, num_steps=3, verbose=False)
         assert out.dtype == torch.float64
 
     def test_sampler_delegates_not_snapshots(self):
-        from flow_inference.sampler import IntegratorSampler
-
         f = self._flow()
-        s = IntegratorSampler(f)  # built *before* the move
+        s = IntegratorSampler(f)  # built before the move
         f.double()
         assert s.dtype == torch.float64
 
     def test_probe_not_in_state_dict(self):
-        # persistent=False, so existing checkpoints still load.
+        # The probe is non-persistent, so it never appears in checkpoints.
         assert "_probe" not in self._flow().state_dict()
 
     def test_state_dict_round_trips(self):
@@ -547,8 +537,6 @@ class TestDeviceDtypeTracking:
         not torch.cuda.is_available(), reason="needs CUDA to test a device move"
     )
     def test_sample_after_cuda_move(self):
-        from flow_inference.sampler import IntegratorSampler
-
         f = self._flow().to("cuda")
         assert f.device == f.L.device
         out = IntegratorSampler(f).sample(num_samples=2, num_steps=3, verbose=False)
@@ -556,17 +544,12 @@ class TestDeviceDtypeTracking:
 
 
 # ---------------------------------------------------------------------------
-# GaussianProcessFlow built from a kernel + mean function on a grid, rather than
-# from a precomputed covariance. The matrix route stays available as
-# from_covariance(), which is also the only way to get a batched (C, N, N)
-# multi-channel flow — a single kernel cannot express that.
+# GaussianProcessFlow from a kernel and mean function on a grid
 # ---------------------------------------------------------------------------
 
 
 class TestGaussianProcessFlowFromKernel:
     def _kernel_and_grid(self):
-        import gpytorch
-
         kernel = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel())
         kernel.base_kernel.lengthscale = 0.3
         grid = torch.linspace(0, 1, N).unsqueeze(-1)
@@ -586,10 +569,6 @@ class TestGaussianProcessFlowFromKernel:
 
     def test_accepts_posterior_mean_and_kernel(self):
         # The pairing gp_posterior() is built for.
-        import gpytorch
-
-        from flow_inference.gp_utils import gp_posterior
-
         base = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel()).double()
         base.base_kernel.lengthscale = 0.3
         train_x = torch.rand(6, 1, dtype=torch.float64)
@@ -599,12 +578,10 @@ class TestGaussianProcessFlowFromKernel:
         mean, kern = gp_posterior(base, train_x, train_y, noise=1e-4)
         flow = GaussianProcessFlow(kern, mean, grid)
         assert flow.latent_dim == N
-        # the flow's mean is the posterior mean on the grid
+        # The flow's mean is the posterior mean on the grid.
         assert torch.allclose(flow.target_mean[0], mean(grid), atol=1e-8)
 
     def test_mean_is_carried_into_data_space(self):
-        import gpytorch
-
         kernel, _, grid = self._kernel_and_grid()
         const = gpytorch.means.ConstantMean()
         with torch.no_grad():
@@ -614,8 +591,6 @@ class TestGaussianProcessFlowFromKernel:
         assert torch.allclose(out, torch.full((1, 1, N), 2.0), atol=1e-5)
 
     def test_sampler_runs_on_kernel_built_flow(self):
-        from flow_inference.sampler import IntegratorSampler
-
         kernel, mean, grid = self._kernel_and_grid()
         flow = GaussianProcessFlow(kernel, mean, grid)
         out = IntegratorSampler(flow).sample(num_samples=3, num_steps=4, verbose=False)
@@ -623,10 +598,10 @@ class TestGaussianProcessFlowFromKernel:
 
 
 # ---------------------------------------------------------------------------
-# BasisGaussianProcessFlow — a GP flow parameterised by basis weights.
+# BasisGaussianProcessFlow
 #
-# The load-bearing design choice: the basis is applied in to_display (end of
-# sampling only), NOT in _to_data_space (which guidance goes through). That keeps
+# A GP flow parameterised by basis weights. The basis is applied in to_display (end
+# of sampling only), not in _to_data_space (which guidance goes through). That keeps
 # conditions in weight space, where a basis with closed-form derivatives can supply
 # exact ones, while the sampler still returns function values.
 # ---------------------------------------------------------------------------
@@ -635,11 +610,6 @@ BASIS_R = 24
 
 
 def _rff_basis(n_side=6):
-    import gpytorch
-
-    from flow_inference.flow_utils import build_grid_in_box
-    from flow_inference.gp_utils import RFFBasis
-
     grid = build_grid_in_box(n_side, n_side, "cpu").double()
     kernel = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel()).double()
     kernel.base_kernel.lengthscale = 0.3
@@ -685,16 +655,12 @@ class TestBasisGaussianProcessFlow:
         assert torch.equal(flow._to_data_space(z), z)
 
     def test_sampler_returns_function_space(self):
-        from flow_inference.sampler import IntegratorSampler
-
         basis, grid, n = _rff_basis()
         flow = BasisGaussianProcessFlow(basis, grid)
         out = IntegratorSampler(flow).sample(num_samples=3, num_steps=4, verbose=False)
         assert out.shape == (3, 1, n)
 
     def test_display_shape_applied(self):
-        from flow_inference.sampler import IntegratorSampler
-
         basis, grid, _ = _rff_basis(n_side=6)
         flow = BasisGaussianProcessFlow(basis, grid, output_shape=(6, 6))
         out = IntegratorSampler(flow).sample(num_samples=2, num_steps=4, verbose=False)
@@ -706,9 +672,7 @@ class TestBasisGaussianProcessFlow:
             BasisGaussianProcessFlow(basis, grid, output_shape=(5, 5))
 
     def test_guidance_sees_weights_not_functions(self):
-        # The whole reason the basis lives in to_display rather than _to_data_space.
-        from flow_inference.guidance import GuidanceMC
-
+        # The reason the basis lives in to_display rather than _to_data_space.
         basis, grid, _ = _rff_basis()
         cond = _WeightCondition(basis, grid)
         flow = BasisGaussianProcessFlow(basis, grid)
@@ -724,10 +688,8 @@ class TestBasisGaussianProcessFlow:
         assert seen["shape"][-1] == BASIS_R  # weights, not the N grid values
 
     def test_matches_manual_weight_flow_plus_sample_functions(self):
-        # Equivalent to the workflow this class replaces.
-        from flow_inference.guidance import GuidanceMC
-        from flow_inference.sampler import IntegratorSampler
-
+        # Equivalent to sampling weights with a plain GaussianFlow and mapping them
+        # through the basis by hand.
         basis, grid, _n = _rff_basis()
         cond = _WeightCondition(basis, grid)
 
@@ -752,7 +714,7 @@ class TestBasisGaussianProcessFlow:
 
 
 # ---------------------------------------------------------------------------
-# Affine data space: the hooks GuidanceMC's fast path is built on
+# Affine data space: the hooks behind GuidanceMC's affine path
 # ---------------------------------------------------------------------------
 
 
@@ -798,7 +760,7 @@ class TestAffineDataSpace:
         draws = flow.sample_terminal(z_t, torch.tensor(t), num_samples=5)  # same noise
         decoded = flow._to_data_space(draws.reshape(B * 5, 2, N)).reshape(B, 5, 2, N)
         assert data.shape == (B, 5, 2, N)
-        assert torch.allclose(data, decoded, atol=1e-10)
+        assert torch.allclose(data, decoded, atol=1e-5)  # float32 rounding
 
     def test_sample_terminal_data_keeps_gradient_to_z_t(self):
         flow = _two_channel_gp_flow()
@@ -816,18 +778,6 @@ class TestAffineDataSpace:
         flow.sample_terminal_data(z_t, torch.tensor(0.2), num_samples=3)
         assert flow._z_decoded is cached
 
-    def test_decoded_noise_follows_redrawn_noise(self):
-        # Anything that redraws the shared noise (here a resample_noise caller) must
-        # invalidate the decoded copy, or the draws would silently go stale.
-        flow = _two_channel_gp_flow()
-        z_t, t = torch.randn(B, 2, N), torch.tensor(0.5)
-        flow.sample_terminal_data(z_t, t, num_samples=3)
-        flow.sample_terminal(z_t, t, num_samples=3, resample_noise=True)
-        data = flow.sample_terminal_data(z_t, t, num_samples=3)
-        draws = flow.sample_terminal(z_t, t, num_samples=3)  # the redrawn noise
-        decoded = flow._to_data_space(draws.reshape(B * 3, 2, N)).reshape(B, 3, 2, N)
-        assert torch.allclose(data, decoded, atol=1e-10)
-
     @pytest.mark.parametrize("batch, samples", [(B + 1, 3), (B, 4)])
     def test_decoded_noise_redrawn_on_shape_change(self, batch, samples):
         flow = _two_channel_gp_flow()
@@ -842,3 +792,25 @@ class TestAffineDataSpace:
         z_t = torch.randn(B, 1, increment_flow.latent_dim)
         with pytest.raises(NotImplementedError, match="nonlinear"):
             increment_flow.sample_terminal_data(z_t, torch.tensor(0.5), num_samples=2)
+
+
+# ---------------------------------------------------------------------------
+# Positive-semidefiniteness check on the covariance
+# ---------------------------------------------------------------------------
+
+
+class TestWhitenFactorsPSDCheck:
+    def test_indefinite_covariance_warns(self):
+        K = torch.diag(torch.tensor([1.0, 0.5, -0.2], dtype=torch.float64))[None]
+        with pytest.warns(UserWarning, match="not positive semidefinite"):
+            _whiten_factors(K, jitter=1e-8)
+
+    def test_ill_conditioned_but_valid_kernel_does_not_warn(self):
+        # RBF on 200 points: singular to working precision, with rounding-level
+        # negative eigenvalues, which must not trigger the check.
+        kernel = gpytorch.kernels.RBFKernel().double()
+        kernel.lengthscale = 0.1
+        grid = torch.linspace(0, 1, 200, dtype=torch.float64).unsqueeze(-1)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            GaussianProcessFlow(kernel, gpytorch.means.ZeroMean(), grid, jitter=0.0)

@@ -1,3 +1,5 @@
+"""A fixed pool of unconditional samples from a map, for training a neural flow."""
+
 import logging
 
 import torch
@@ -8,9 +10,19 @@ logger = logging.getLogger(__name__)
 
 
 class TrainingSampler:
+    """Draws training batches from a pool of samples generated once from a map.
+
+    The pool is generated at construction by pushing standard normal latents through
+    ``map``; each call then returns a random batch from it.
+
+    Args:
+        num_samples: size of the pool.
+        map: the map to sample from; its ``output_shape`` must be a 2D grid
+            ``(H, W)``.
+        buffer_size: largest number of samples generated in one call to ``map``.
+    """
+
     def __init__(self, num_samples: int, map: BaseMap, buffer_size: int = 100):
-        # The training target is an image on an H×W grid, so the map's output_shape
-        # must be 2D.
         if len(map.output_shape) != 2:
             raise ValueError(
                 f"TrainingSampler needs a map on an H×W grid, but "
@@ -22,7 +34,7 @@ class TrainingSampler:
             raise ValueError(f"num_samples must be positive, got {num_samples}")
         self.num_samples = num_samples
         self.buffer_size = buffer_size
-        # Draw in chunks of at most buffer_size; the final chunk may be short.
+        # In chunks of at most buffer_size; the final chunk may be short.
         samples = []
         drawn = 0
         while drawn < num_samples:
@@ -37,22 +49,22 @@ class TrainingSampler:
 
     @property
     def device(self) -> torch.device:
-        """Delegated to the map, so it follows a ``map.to(...)`` after construction."""
+        """The map's device, so it follows a later ``map.to(...)``."""
         return self.map.device
 
     @property
     def dtype(self) -> torch.dtype:
-        """Delegated to the map, so latents are drawn in the precision it expects."""
+        """The map's dtype, so latents are drawn in the precision it expects."""
         return self.map.dtype
 
     def __call__(self, batch_size):
-        """
-        Sample a batch of functions on an HxW grid.
+        """A random batch from the pool, drawn with replacement.
 
         Args:
-            batch_size: number of samples
+            batch_size: number of samples ``B``.
+
         Returns:
-            f: (B, C, H*W) — the flat field; callers reshape to (B, C, H, W)
+            Flat fields ``(B, C, H * W)``.
         """
         random_indices = torch.randint(0, self.samples.shape[0], (batch_size,))
         return self.samples[random_indices].to(self.device)

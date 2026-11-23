@@ -1,3 +1,12 @@
+"""Tests for the conditions (``flow_inference.conditions``).
+
+Covers the relaxed log-likelihoods of equality and binary conditions, their products,
+the standardised residual view, grid-aware reshaping and quadrature weights. Weighted
+conditions are checked to converge to their continuum integrals under grid refinement.
+"""
+
+import math
+
 import gpytorch
 import pytest
 import torch
@@ -9,15 +18,10 @@ from flow_inference.conditions import (
     PointWiseCondition,
     ProductCondition,
 )
+from tests.conftest import IdentityKernel, PositivityCondition
 
 N = 16  # spatial points
 B = 5  # batch size
-
-
-# A concrete BinaryCondition for tests: every entry should be positive.
-class PositivityCondition(BinaryCondition):
-    def smooth_eval_condition(self, x: torch.Tensor) -> torch.Tensor:
-        return x
 
 
 @pytest.fixture
@@ -210,13 +214,14 @@ class TestAbstractContracts:
 
 
 # ---------------------------------------------------------------------------
-# standardised_residual: the residual-in-units-of-sigma view that derivative-free
-# ensemble guidance builds its Kalman gain from. logp alone is not enough there —
-# the gain needs the *vector* residual, one component at a time.
+# standardised_residual
 # ---------------------------------------------------------------------------
 
 
 class TestStandardisedResidual:
+    """The residual in units of sigma, for methods that need the vector residual
+    (e.g. a Gauss-Newton curvature) rather than just logp."""
+
     def test_base_condition_reports_what_is_missing(self):
         class LogpOnly(BaseCondition):
             def logp(self, x):
@@ -230,7 +235,7 @@ class TestStandardisedResidual:
         assert torch.allclose(
             pointwise.standardised_residual(x), pointwise.residual(x) / 0.1
         )
-        # Zero residual exactly on target, so the implied N(0, sigma^2) model is right.
+        # Zero exactly on target, consistent with the implied N(0, sigma^2) model.
         assert pointwise.standardised_residual(torch.zeros(B, 1, N)).abs().max() == 0.0
 
     def test_equality_residual_is_scale_free_in_sigma(self, mask_first4):
@@ -273,8 +278,8 @@ class TestStandardisedResidual:
         r_pw = pointwise.standardised_residual(x)
         r_bin = binary.standardised_residual(x)
         assert r.shape == (B, 1, r_pw.shape[-1] + r_bin.shape[-1])
-        # Each block arrives already divided by its own sigma, so no full-size sigma
-        # tensor is ever materialised alongside the residual in the hot loop.
+        # Each block arrives already divided by its own sigma, so the product only
+        # concatenates.
         assert torch.equal(r, torch.cat([r_pw, r_bin], dim=-1))
 
     def test_product_raises_when_a_subcondition_has_no_residual(self, pointwise):
@@ -288,7 +293,7 @@ class TestStandardisedResidual:
 
 
 # ---------------------------------------------------------------------------
-# Grid awareness: output_shape auto-wiring + as_grid
+# Grid awareness: output_shape binding and as_grid
 # ---------------------------------------------------------------------------
 
 
@@ -315,7 +320,7 @@ class TestGridAwareConditions:
     def test_bind_keeps_explicit_shape(self):
         c = _GridResidual(sigma=0.1)
         c.output_shape = (2, 8)
-        c.bind_output_shape((4, 4))  # must NOT overwrite the explicit (2, 8)
+        c.bind_output_shape((4, 4))  # keeps the explicit (2, 8)
         assert c.output_shape == (2, 8)
 
     def test_as_grid_rejects_mismatched_width(self):
@@ -336,10 +341,9 @@ class TestGridAwareConditions:
         assert c.logp(torch.randn(B, 1, N)).shape == (B,)
 
     def test_guidance_autowires_from_flow(self):
-        # The flow's output_shape should reach the condition via guidance construction.
+        # The flow's output_shape reaches the condition when guidance is built.
         from flow_inference.flows import GaussianProcessFlow
         from flow_inference.guidance import GuidanceMC
-        from tests.conftest import IdentityKernel
 
         grid = torch.linspace(0, 1, N).unsqueeze(-1)  # N == 16 here, so (4, 4) fits
         flow = GaussianProcessFlow(
@@ -352,3 +356,137 @@ class TestGridAwareConditions:
         assert c.output_shape is None
         GuidanceMC(flow, c, num_mc_samples=1)
         assert c.output_shape == (4, 4)
+
+
+# ---------------------------------------------------------------------------
+# Quadrature weights
+# ---------------------------------------------------------------------------
+
+
+class _Slope(EqualityCondition):
+    """f'(x) by centred differences on the interior of the grid x_i = i / n."""
+
+    def residual(self, x):
+        n = x.shape[-1]
+        return (x[..., 2:] - x[..., :-2]) * (n / 2)
+
+
+class _Increasing(BinaryCondition):
+    """Monotonicity with a continuum limit: the margin is the slope, not a difference."""
+
+    def smooth_eval_condition(self, x):
+        n = x.shape[-1]
+        return (x[..., 1:] - x[..., :-1]) * n
+
+
+def _on_grid(fn, n):
+    return fn(torch.arange(n) / n)[None, None]  # (1, 1, n)
+
+
+class TestQuadratureWeights:
+    def test_default_is_unweighted(self, pointwise):
+        x = torch.randn(B, 1, N)
+        ones = PointWiseCondition(
+            pointwise.target_field, pointwise.mask, 0.1, torch.ones(4)
+        )
+        assert pointwise.quadrature_weights is None
+        assert torch.allclose(pointwise.logp(x), ones.logp(x))
+
+    def test_scalar_weight_scales_logp(self, pointwise):
+        x = torch.randn(B, 1, N)
+        scaled = PointWiseCondition(pointwise.target_field, pointwise.mask, 0.1, 0.25)
+        assert torch.allclose(scaled.logp(x), 0.25 * pointwise.logp(x))
+
+    def test_per_component_weights(self, pointwise):
+        x = torch.randn(B, 1, N)
+        first_only = PointWiseCondition(
+            pointwise.target_field, pointwise.mask, 0.1, torch.tensor([1.0, 0, 0, 0])
+        )
+        assert torch.allclose(first_only.logp(x), -0.5 * (x[:, 0, 0] / 0.1) ** 2)
+
+    def test_weights_broadcast_over_channels(self):
+        class Identity(EqualityCondition):
+            def residual(self, x):
+                return x
+
+        x, w = torch.randn(B, 2, N), torch.rand(2, N)
+        expected = (-0.5 * (x / 0.5) ** 2 * w).sum(dim=[1, 2])
+        assert torch.allclose(Identity(sigma=0.5, weights=w).logp(x), expected)
+
+    @pytest.mark.parametrize("weights", [None, 0.3, torch.rand(4)])
+    def test_standardised_residual_matches_logp(self, pointwise, weights):
+        cond = PointWiseCondition(pointwise.target_field, pointwise.mask, 0.1, weights)
+        x = torch.randn(B, 1, N)
+        r = cond.standardised_residual(x)
+        assert torch.allclose(-0.5 * (r**2).sum(dim=[1, 2]), cond.logp(x), rtol=1e-5)
+
+    def test_binary_weights_scale_logp_and_residual(self):
+        x = torch.randn(B, 1, N)
+        plain, weighted = (
+            PositivityCondition(0.1),
+            PositivityCondition(0.1, weights=0.5),
+        )
+        assert torch.allclose(weighted.logp(x), 0.5 * plain.logp(x))
+        assert torch.allclose(
+            weighted.standardised_residual(x),
+            plain.standardised_residual(x) * math.sqrt(0.5),
+        )
+
+    @pytest.mark.parametrize("bad", [-1.0, float("nan"), float("inf")])
+    def test_invalid_weights_raise(self, bad):
+        with pytest.raises(ValueError, match="non-negative"):
+            PositivityCondition(v=0.1, weights=bad)
+
+    def test_subclass_may_use_its_own_weights_attribute(self):
+        # The quadrature weights live under their own name, so a subclass is free to
+        # keep an unrelated `weights` attribute (region masks, say).
+        class Regions(EqualityCondition):
+            def __init__(self):
+                super().__init__(sigma=1.0, weights=0.5)
+                self.weights = torch.ones(3, N)
+
+            def residual(self, x):
+                return (x[:, 0] @ self.weights.T).unsqueeze(1)
+
+        x = torch.randn(B, 1, N)
+        expected = -0.5 * 0.5 * ((x[:, 0] @ torch.ones(N, 3)) ** 2).sum(-1)
+        assert torch.allclose(Regions().logp(x), expected, rtol=1e-5)
+
+    def test_weights_follow_dtype_and_state_dict(self, pointwise):
+        cond = PointWiseCondition(
+            pointwise.target_field, pointwise.mask, 0.1, torch.rand(4)
+        )
+        assert cond.double().quadrature_weights.dtype == torch.float64
+        fresh = PointWiseCondition(
+            pointwise.target_field, pointwise.mask, 0.1, torch.zeros(4)
+        )
+        fresh.load_state_dict(cond.state_dict())
+        assert torch.equal(fresh.quadrature_weights, cond.quadrature_weights)
+
+    def test_weighted_equality_converges_under_refinement(self):
+        # f = sin(2 pi x): integral of f'^2 over [0, 1) is 2 pi^2. The interior-only
+        # stencil drops two boundary cells, an O(1/n) error that vanishes as n grows.
+        sigma = 2.0
+        integral = -(2 * math.pi**2) / (2 * sigma**2)
+        errors, unweighted = [], []
+        for n in (64, 256, 1024):
+            f = _on_grid(lambda x: torch.sin(2 * math.pi * x), n)
+            weighted = _Slope(sigma=sigma, weights=1.0 / n).logp(f).item()
+            errors.append(abs(weighted - integral) / abs(integral))
+            unweighted.append(_Slope(sigma=sigma).logp(f).item())
+        assert errors[0] > errors[1] > errors[2] and errors[2] < 0.01
+        # Without weights the same function is penalised ~n times harder.
+        assert unweighted[2] / unweighted[0] == pytest.approx(16.0, rel=0.1)
+
+    def test_weighted_binary_converges_under_refinement(self):
+        # f(x) = x has slope 1 everywhere, so the weighted logp is the integral of
+        # logsigmoid(1 / v) over the n - 1 cells: (n - 1) / n of logsigmoid(1 / v).
+        v = 1.0
+        per_unit = torch.nn.functional.logsigmoid(torch.tensor(1.0 / v)).item()
+        unweighted = []
+        for n in (64, 256, 1024):
+            f = _on_grid(lambda x: x, n)
+            weighted = _Increasing(v=v, weights=1.0 / n).logp(f).item()
+            assert weighted == pytest.approx(per_unit * (n - 1) / n, rel=1e-4)
+            unweighted.append(_Increasing(v=v).logp(f).item())
+        assert unweighted[2] / unweighted[0] == pytest.approx(1023 / 63, rel=1e-4)

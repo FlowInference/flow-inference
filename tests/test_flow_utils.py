@@ -1,3 +1,6 @@
+"""Tests for the grid, clipping and time-schedule helpers
+(``flow_inference.flow_utils``)."""
+
 import pytest
 import torch
 
@@ -19,13 +22,12 @@ class TestBuildGridInBox:
     def test_shape(self):
         assert build_grid_in_box(3, 4).shape == (12, 2)
 
-    def test_defaults_to_float64(self):
-        # Coordinates feed kernels and finite-difference stencils, so the grid
-        # defaults to double regardless of the ambient default dtype.
-        assert build_grid_in_box(3, 4).dtype == torch.float64
+    def test_defaults_to_the_default_dtype(self):
+        # Kernel matrices are assembled from a float64 copy regardless, so the grid
+        # can follow torch's default dtype.
+        assert build_grid_in_box(3, 4).dtype == torch.get_default_dtype()
 
     def test_dtype_override(self):
-        # The float32 opt-out a learned NeuralFlow pipeline needs.
         assert build_grid_in_box(3, 4, dtype=torch.float32).dtype == torch.float32
 
     def test_inside_unit_box(self):
@@ -77,8 +79,8 @@ class TestClipVectorField:
         assert torch.isfinite(clip_vector_field(dv, max_norm=10.0)).all()
 
     def test_clips_per_spatial_point_independently(self):
-        # Two points in one (B, C, N) row with very different magnitudes; the small
-        # one stays small, the large one saturates — clipping is along the last dim.
+        # Two channels with very different magnitudes: the small one stays small and
+        # the large one saturates, because clipping acts along the last dim only.
         dv = torch.zeros(1, 2, N)
         dv[0, 0] = 1e-3  # tiny channel
         dv[0, 1] = 1e3  # huge channel

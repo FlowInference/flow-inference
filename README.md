@@ -14,19 +14,19 @@ Guided flow-based sampling of stochastic processes under user-specified conditio
   <img src="assets/gp-flow.svg" alt="White noise flowing into Gaussian-process sample paths that pass through the observations" width="760">
 </p>
 
-`flow_inference` draws samples of a stochastic process — a Gaussian process, an SDE
-solution, or anything a neural flow can be trained on — that satisfy a condition you
-supply: an ODE or PDE residual, a shape constraint such as monotonicity, a point-process
-likelihood, and so on. It does this by integrating a probability-flow ODE (or SDE) from
-noise to the process, steering each step with a guidance term computed from the
-condition's log-likelihood.
+`flow_inference` draws samples of a stochastic process (a Gaussian process, an SDE
+solution, or anything a neural flow can be trained on) that satisfy a condition you
+supply: an ODE or PDE residual, a shape constraint such as monotonicity, a
+point-process likelihood, and so on. It does this by integrating a probability-flow
+ODE (or SDE) from noise to the process, steering each step with a guidance term
+computed from the condition's log-likelihood.
 
 <p align="center">
   <img src="assets/conditions.png" alt="Four kinds of condition on a random field f(x): non-linear observation mechanisms, non-Gaussian observation noise, non-linear physical relationships, and field constraints" width="720">
 </p>
 
-> **Want to see the examples run?** The notebooks in this repo are stored without
-> outputs. Browse them fully executed, with every figure, at
+> **Want to see the examples run?** The notebooks in this repository are stored
+> without outputs. Browse them fully executed, with every figure, at
 > **<https://flowinference.github.io/flow-inference/>**.
 
 ## Installation
@@ -52,8 +52,6 @@ from flow_inference.flows import GaussianProcessFlow
 from flow_inference.guidance import GuidanceMC
 from flow_inference.sampler import IntegratorSampler
 
-torch.set_default_dtype(torch.float64)
-
 # A GP prior on 128 points in [0, 1].
 grid = build_grid_in_box(128, 1)
 kernel = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel())
@@ -75,6 +73,17 @@ samples = IntegratorSampler(flow).sample(16, guidance=guidance, num_steps=500)
 To condition on data as well, build the flow from a GP posterior instead:
 `mean, kernel = gp_posterior(kernel, X, y)` from `flow_inference.gp_utils`.
 
+### Precision
+
+The library works in float32, which is much faster on GPUs. The exception is the
+kernel matrix: `GaussianProcessFlow`, `gp_posterior`, `fit_kernel_hyperparameters`
+and the GP-based maps assemble and factorise it in float64, because GP Gram matrices
+are too badly conditioned for a float32 factorisation, and then store the result in
+the working dtype. A flow takes its working dtype from its kernel; to run in float64
+throughout, build the kernel in float64 or pass `dtype=torch.float64` to
+`GaussianProcessFlow`. Conditions should match the flow's dtype: a float64 condition
+on a float32 flow works but runs in float64, so the guidance warns about it
+(`condition.float()` fixes it).
 
 ## Related papers
 
@@ -95,9 +104,8 @@ The methods in this library are developed in:
 
 ## Examples
 
-Each notebook in [`examples/`](examples/) is self-contained. They are committed without
-outputs; rendered versions with all figures are at
-<https://flowinference.github.io/flow-inference/>.
+Each notebook in [`examples/`](examples/) is self-contained. Rendered versions, with
+all figures, are at <https://flowinference.github.io/flow-inference/>.
 
 | Notebook | Condition | Problem |
 |---|---|---|
@@ -122,12 +130,40 @@ outputs; rendered versions with all figures are at
 |---|---|
 | `flows` | The flows to sample from: `GaussianFlow`, `GaussianProcessFlow` (function space), `BasisGaussianProcessFlow` (weight space), `GaussianIncrementFlow`, `NeuralFlow` (learned) |
 | `conditions` | What samples should satisfy: `EqualityCondition` (residuals), `BinaryCondition` (inequalities), `PointWiseCondition`, `ProductCondition` |
-| `guidance` | How the condition steers sampling: `GuidanceDPS`, `GuidanceMPGD`, `GuidanceMC`, `GuidanceMCFisher`, `GuidanceEnsembleKalman` |
-| `sampler` | `IntegratorSampler` (ODE/SDE integration) and `PCNCorrector` (gradient-free MCMC correction) |
-| `mcmc` | Baselines on the same latent target, run directly on the N(0, I) innovations: preconditioned Crank–Nicolson (`pcn`), elliptical slice sampling (`elliptical_slice`), Hamiltonian Monte Carlo (`hmc`) and likelihood-tempered SMC (`tempered_smc`, which also estimates the evidence) |
+| `guidance` | How the condition steers sampling: `GuidanceDPS`, `GuidanceMPGD`, `GuidanceMC` |
+| `sampler` | `IntegratorSampler` (ODE/SDE integration) |
 | `gp_utils` | GP posteriors, kernel fitting, and random-Fourier-feature bases |
 | `maps`, `training_samplers` | Non-Gaussian spatial processes (Student-t, Brown–Resnick, Lévy–NIG, ...) as maps from Gaussian noise, and the training data they provide for `NeuralFlow` |
 | `schedules`, `flow_utils` | Noise schedules and grid helpers |
+
+The main classes and functions are also importable from the top level
+(`from flow_inference import GaussianProcessFlow, GuidanceMC, IntegratorSampler`).
+
+### Benchmarks
+
+[`benchmarks/`](benchmarks/) sits outside the library and is not installed with it.
+It holds classical methods that run on the same whitened target as the guided
+samplers, for use as baselines:
+
+- `benchmarks/mcmc.py`: preconditioned Crank–Nicolson (`pcn`) and its gradient
+  version (`pcn_mala`), elliptical slice sampling (`elliptical_slice`), Hamiltonian
+  Monte Carlo (`hmc`), the No-U-Turn Sampler (`nuts`, via Pyro) and
+  likelihood-tempered SMC (`tempered_smc`);
+- `benchmarks/ep.py`: expectation propagation (`ep`), a Gaussian approximation for
+  conditions that factorise into sites on linear functionals of the field (point
+  observations, monotonicity, bounds);
+- `benchmarks/lin_ess.py`: reference answers for conditions made of linear
+  inequalities and Gaussian observations: exact draws by LIN-ESS and the evidence by
+  subset simulation (`lin_ess`), to score the other methods against.
+
+A script compares them with guided sampling on a shared likelihood budget, by
+default on a GP regression problem whose exact posterior is known. NUTS needs the
+`benchmarks` dependency group (`pip install -e . --group benchmarks`).
+
+```bash
+python -m benchmarks.innovation_space --num-samples 500
+python -m benchmarks.innovation_space --methods NUTS EP   # a subset
+```
 
 ## Development
 
@@ -162,7 +198,6 @@ pytest -m notebooks  # smoke-run every example notebook (about a minute on CPU)
 The notebook smoke tests execute each notebook with capped sampling and training
 budgets, so they check that the examples run, not that their results are good.
 
-
 ## Citation
 
 If you use `flow_inference` in your work, please cite it (GitHub's "Cite this
@@ -170,7 +205,7 @@ repository" button exports this from [`CITATION.cff`](CITATION.cff)):
 
 ```bibtex
 @software{moss2026flowinference,
-  author  = {Moss, Henry and Astfalck, Lachlan and Cowperthwaite, Thomas and Sharrock, Louis and Zammit-Mangion Andrew},
+  author  = {Moss, Henry and Astfalck, Lachlan and Cowperthwaite, Thomas and Sharrock, Louis and Zammit-Mangion, Andrew},
   title   = {flow\_inference: guided flow-based sampling of stochastic processes},
   year    = {2026},
   version = {0.1.0},
@@ -178,6 +213,6 @@ repository" button exports this from [`CITATION.cff`](CITATION.cff)):
 }
 ```
 
-## License
+## Licence
 
-MIT — see [LICENSE](LICENSE).
+MIT; see [LICENSE](LICENSE).

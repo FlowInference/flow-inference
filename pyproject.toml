@@ -31,6 +31,10 @@ dev = [
     "pytest>=9.0.2",
     "ruff>=0.15.5",
 ]
+# Baselines in benchmarks/ (outside the library): Pyro for NUTS.
+benchmarks = [
+    "pyro-ppl>=1.9",
+]
 # Rendered example notebooks site; see scripts/build_docs.py.
 docs = [
     "mkdocs-jupyter>=0.27",
@@ -56,6 +60,10 @@ minversion = "9.0"
 addopts = ["-ra", "--tb=short", "-m", "not slow and not notebooks"]
 log_level = "INFO"
 testpaths = ["tests"]
+filterwarnings = [
+    # Raised on import by gpytorch's linear_operator dependency, not by this package.
+    "ignore:`torch.jit.script` is deprecated:FutureWarning",
+]
 markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
     "notebooks: executes the example notebooks with capped budgets (run with '-m notebooks')",

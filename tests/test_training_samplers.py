@@ -1,9 +1,8 @@
-"""Tests for TrainingSampler.
+"""Tests for the training-data sampler (``flow_inference.training_samplers``).
 
-TrainingSampler pre-generates a fixed pool of unconditional field samples from a
-map (drawing iid N(0,1) latents and pushing them through ``map``), then serves
-random minibatches from that pool. It is the data source the NeuralFlow trains
-against — there is no closed-form density, only these samples.
+``TrainingSampler`` pre-generates a fixed pool of unconditional field samples by
+pushing iid N(0, 1) latents through a map, then serves random minibatches from that
+pool. It is the data a ``NeuralFlow`` trains on.
 """
 
 import pytest
@@ -29,13 +28,12 @@ class TestTrainingSampler:
         assert ts.samples.shape[0] == 12
 
     def test_pool_exact_when_not_divisible(self, make_map):
-        # The final chunk is short rather than dropped: flooring the division used to
-        # silently lose the remainder (13 -> 10).
+        # The final chunk is short rather than dropped, so no remainder is lost.
         ts = TrainingSampler(num_samples=13, map=make_map(H, W), buffer_size=5)
         assert ts.samples.shape[0] == 13
 
     def test_pool_smaller_than_buffer(self, make_map):
-        # num_samples < buffer_size used to build an empty list and fail in torch.cat.
+        # A pool smaller than one buffer is a single short chunk.
         ts = TrainingSampler(num_samples=3, map=make_map(H, W), buffer_size=100)
         assert ts.samples.shape[0] == 3
 
@@ -44,7 +42,7 @@ class TestTrainingSampler:
             TrainingSampler(num_samples=0, map=make_map(H, W))
 
     def test_batch_shape(self, make_map):
-        # Field samples come back as (B, 1, H*W) — the map's per-sample layout.
+        # Field samples come back as (B, 1, H*W), the map's per-sample layout.
         ts = TrainingSampler(num_samples=12, map=make_map(H, W), buffer_size=6)
         batch = ts(5)
         assert batch.shape == (5, 1, H * W)

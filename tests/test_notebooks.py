@@ -31,7 +31,7 @@ import flow_inference.sampler as _sampler
 import flow_inference.training_samplers as _training_samplers
 
 
-def _cap(owner, name, **caps):
+def _cap(owner, name, adjust=None, **caps):
     original = getattr(owner, name)
     signature = inspect.signature(original)
 
@@ -39,14 +39,26 @@ def _cap(owner, name, **caps):
     def capped(*args, **kwargs):
         bound = signature.bind(*args, **kwargs)
         bound.apply_defaults()
+        if adjust is not None:
+            adjust(bound.arguments)
         for arg, limit in caps.items():
-            bound.arguments[arg] = min(bound.arguments[arg], limit)
+            if bound.arguments[arg] is not None:
+                bound.arguments[arg] = min(bound.arguments[arg], limit)
         return original(*bound.args, **bound.kwargs)
 
     setattr(owner, name, capped)
 
 
-_cap(_sampler.IntegratorSampler, "sample", num_steps=10)
+def _fixed_steps(arguments):
+    # An adaptive solve has no step count to cap (num_steps is None) and raises if it
+    # hits max_steps, so run it as a capped fixed-step solve instead. The adaptive
+    # integrator itself is covered by tests/test_sampler.py.
+    if arguments.get("adaptive"):
+        arguments["adaptive"] = False
+        arguments["num_steps"] = 10
+
+
+_cap(_sampler.IntegratorSampler, "sample", adjust=_fixed_steps, num_steps=10)
 _cap(_flows.NeuralFlow, "fit", num_steps=5)
 _cap(_gp_utils, "fit_kernel_hyperparameters", num_iters=5)
 _cap(_training_samplers.TrainingSampler, "__init__", num_samples=32)
